@@ -174,6 +174,20 @@ def run_project_menu(cfg, filebase: FilebaseStorage | None) -> None:
             try:
                 project_dir = pm.create_project(project_id, video_path, title)
                 print(f"  Đã tạo: {project_dir}")
+                # Đẩy ngay lên Filebase khi vừa tạo — không bắt người dùng
+                # phải nhớ vào lại menu "5. Đồng bộ" mới có project trên
+                # cloud. Nếu chưa cấu hình Filebase thì bỏ qua im lặng
+                # (sync_to_cloud tự trả lỗi rõ ràng trong trường hợp đó).
+                if filebase:
+                    print("  [filebase] Đang đẩy project mới lên cloud...")
+                    result = pm.sync_to_cloud(project_id)
+                    if result.get("error") or result.get("aborted"):
+                        print(f"  [filebase] CẢNH BÁO: đẩy lên cloud thất bại: {result}")
+                    else:
+                        print(f"  [filebase] Đã có trên cloud: {result['uploaded']} file tải lên.")
+                else:
+                    print("  [filebase] Chưa cấu hình Filebase — project chỉ đang ở local. "
+                          "Điền access_key/secret_key trong config.toml để tự động đẩy lên cloud.")
             except ValueError as e:
                 print(f"  Lỗi: {e}")
 
