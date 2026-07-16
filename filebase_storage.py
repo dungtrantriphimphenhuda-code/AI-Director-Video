@@ -33,6 +33,7 @@ class FilebaseStorage:
         secret_key: str,
         bucket_name: str = "ai-director-video",
         endpoint_url: str = "https://s3.filebase.com",
+        auto_create_bucket: bool = True,
     ):
         if not HAS_BOTO3:
             raise ImportError("Cần cài boto3 để dùng Filebase storage. Chạy: pip install boto3")
@@ -47,11 +48,58 @@ class FilebaseStorage:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             endpoint_url=endpoint_url,
+            # Filebase yêu cầu region_name="us-east-1" bắt buộc để tính chữ ký
+            # request (SigV4) đúng cách — không phụ thuộc region mặc định của
+            # máy/AWS profile người dùng (nếu có), tránh lỗi ký sai âm thầm.
+            region_name="us-east-1",
             config=Config(
                 signature_version="s3v4",
                 s3={"addressing_style": "path"},
             ),
         )
+
+        # bucket_ready = bucket đã xác nhận tồn tại (hoặc vừa được tự tạo) và
+        # dùng được. Mọi hàm upload/list/download bên dưới sẽ kiểm tra cờ này
+        # trước, để báo lỗi 1 lần rõ ràng thay vì thất bại lặp lại từng file.
+        self.bucket_ready = False
+        if auto_create_bucket:
+            self.bucket_ready = self.ensure_bucket()
+
+    def ensure_bucket(self) -> bool:
+        """Kiểm tra bucket đã tồn tại chưa; nếu chưa, tự tạo trên Filebase.
+
+        Trả về True nếu bucket sẵn sàng dùng được (đã có sẵn hoặc vừa tạo
+        thành công), False nếu không dùng được (vd tên bucket đã bị người
+        khác dùng — tên bucket trên Filebase là DUY NHẤT TOÀN CỤC, giống S3).
+        """
+        try:
+            self.client.head_bucket(Bucket=self.bucket_name)
+            return True
+        except Exception as e:
+            error_code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+            if error_code not in ("404", "NoSuchBucket", "NotFound", ""):
+                print(f"[filebase] Không kiểm tra được bucket '{self.bucket_name}': {e}")
+                return False
+
+        # Bucket chưa tồn tại -> thử tự tạo
+        try:
+            self.client.create_bucket(Bucket=self.bucket_name)
+            print(f"[filebase] Bucket '{self.bucket_name}' chưa có trên Filebase — đã tự tạo mới.")
+            return True
+        except Exception as e:
+            error_code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+            if error_code == "BucketAlreadyOwnedByYou":
+                return True
+            if error_code == "BucketAlreadyExists":
+                print(
+                    f"[filebase] LỖI: Tên bucket '{self.bucket_name}' đã bị tài khoản "
+                    f"khác dùng (tên bucket trên Filebase là duy nhất toàn cục, giống "
+                    f"AWS S3). Hãy đổi 'bucket_name' trong config.toml sang 1 tên khác, "
+                    f"riêng biệt cho bạn (vd 'ai-director-video-<ten-cua-ban>'), rồi chạy lại."
+                )
+            else:
+                print(f"[filebase] Không tự tạo được bucket '{self.bucket_name}': {e}")
+            return False
 
     def _upload_file(self, local_path: Path, remote_key: str) -> bool:
         """Upload 1 file lên Filebase."""
@@ -120,6 +168,12 @@ class FilebaseStorage:
         (head_object) và bỏ qua nếu trùng, để tránh upload lại hàng GB không
         cần thiết mỗi lần đồng bộ.
         """
+        if not self.bucket_ready:
+            print(f"[filebase] Bỏ qua đồng bộ: bucket '{self.bucket_name}' chưa sẵn sàng "
+                  f"(xem lỗi ensure_bucket ở trên).")
+            return {"uploaded": 0, "skipped": 0, "errors": 0, "error_files": [],
+                    "aborted": True}
+
         remote_prefix = f"projects/{project_id}/"
         uploaded = []
         skipped = []
@@ -169,6 +223,9 @@ class FilebaseStorage:
 
     def download_project(self, project_id: str, local_dir: Path) -> bool:
         """Tải 1 project từ Filebase về thư mục cục bộ (bao gồm input/video)."""
+        if not self.bucket_ready:
+            print(f"[filebase] Không tải được: bucket '{self.bucket_name}' chưa sẵn sàng.")
+            return False
         remote_prefix = f"projects/{project_id}/"
         files = self._list_files(remote_prefix)
         if not files:
@@ -195,6 +252,8 @@ class FilebaseStorage:
 
     def list_remote_projects(self) -> list[dict[str, Any]]:
         """Liệt kê tất cả project đang lưu trên Filebase."""
+        if not self.bucket_ready:
+            return []
         projects = {}
         try:
             files = self._list_files("projects/")
@@ -214,6 +273,9 @@ class FilebaseStorage:
 
     def delete_project(self, project_id: str) -> bool:
         """Xoá toàn bộ 1 project trên Filebase."""
+        if not self.bucket_ready:
+            print(f"[filebase] Không xoá được: bucket '{self.bucket_name}' chưa sẵn sàng.")
+            return False
         remote_prefix = f"projects/{project_id}/"
         files = self._list_files(remote_prefix)
         deleted = 0
@@ -225,6 +287,8 @@ class FilebaseStorage:
 
     def sync_checkpoint(self, project_dir: Path, project_id: str, stage: str) -> bool:
         """Upload riêng 1 file checkpoint (dùng cho sync nhanh 1 stage)."""
+        if not self.bucket_ready:
+            return False
         ckpt_file = project_dir / "checkpoints" / f"{stage}.json"
         if ckpt_file.exists():
             remote_key = f"projects/{project_id}/checkpoints/{stage}.json"
@@ -244,12 +308,19 @@ def get_filebase_storage_from_config(cfg) -> FilebaseStorage | None:
         return None
 
     try:
-        return FilebaseStorage(
+        storage = FilebaseStorage(
             access_key=access_key,
             secret_key=secret_key,
             bucket_name=bucket,
             endpoint_url=endpoint,
         )
+        if storage.bucket_ready:
+            print(f"[filebase] Bucket '{bucket}' sẵn sàng.")
+        else:
+            print(f"[filebase] CẢNH BÁO: bucket '{bucket}' KHÔNG dùng được — "
+                  f"tính năng cloud sync sẽ bị bỏ qua cho tới khi bucket được sửa "
+                  f"(xem lỗi ensure_bucket ở trên).")
+        return storage
     except ImportError:
         print("[filebase] Chưa cài boto3. Chạy: pip install boto3")
         return None

@@ -19,6 +19,7 @@ trong config.toml, khiến việc "chọn project" không thực sự cách ly g
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -408,6 +409,14 @@ def run_pipeline_on_project(cfg, pm: ProjectManager, project_id: str, filebase: 
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--no-menu", action="store_true",
+        help="Bỏ qua menu quản lý project, chạy thẳng pipeline trên project mặc định "
+             "(non-interactive), kể cả khi đang chạy trong 1 terminal có TTY.",
+    )
+    args = parser.parse_args()
+
     print("=" * 70)
     print("  AI DIRECTOR VIDEO COMMENTARY — Pipeline nâng cao")
     print("  Kèm Quản lý Project, Đồng bộ Filebase, Checkpoint Real-time")
@@ -428,9 +437,12 @@ def main() -> None:
     # Khởi tạo Filebase
     filebase = get_filebase_storage_from_config(cfg)
 
-    # Kiểm tra có chạy ở chế độ menu project không
+    # Kiểm tra có chạy ở chế độ menu project không.
+    # Chế độ non-interactive được kích hoạt bởi: cờ --no-menu (ưu tiên cao
+    # nhất, đúng như README mô tả), HOẶC không có TTY (vd chạy trong script/
+    # cron), HOẶC show_project_menu_on_start=false trong config.toml.
     show_menu = cfg.get("project.show_project_menu_on_start", True)
-    interactive = sys.stdin.isatty()
+    interactive = sys.stdin.isatty() and not args.no_menu
 
     if interactive and show_menu:
         run_project_menu(cfg, filebase)

@@ -86,6 +86,16 @@ def collect_user_config() -> dict:
     output_dir = ask("Thư mục output", "./output")
     vision_model = ask("Tên model Qwen3-VL trên Hugging Face", "Qwen/Qwen3-VL-4B-Instruct")
 
+    print("\n-- Filebase cloud sync (tuỳ chọn, bỏ trống access key để tắt) --")
+    filebase_access_key = ask("Filebase access key (bỏ trống nếu không dùng cloud sync)", "")
+    filebase_secret_key = ""
+    filebase_bucket = "ai-director-video"
+    if filebase_access_key:
+        filebase_secret_key = ask("Filebase secret key")
+        filebase_bucket = ask(
+            "Tên bucket Filebase (phải DUY NHẤT TOÀN CỤC, giống S3)", "ai-director-video"
+        )
+
     return {
         "cerebras_api_key": cerebras_api_key,
         "cerebras_endpoint": cerebras_endpoint,
@@ -94,6 +104,9 @@ def collect_user_config() -> dict:
         "input_video": input_video,
         "output_dir": output_dir,
         "vision_model": vision_model,
+        "filebase_access_key": filebase_access_key,
+        "filebase_secret_key": filebase_secret_key,
+        "filebase_bucket": filebase_bucket,
     }
 
 
@@ -135,12 +148,28 @@ chars_per_sec = 4.0
 buffer_after_speech = 0.1
 min_clip_duration = 1.0
 max_speed_ratio = 4.0
+micro_checkpoint_interval = 1
+auto_sync_cloud = true
 
 [paths]
 input_video = "{answers['input_video']}"
 output_dir = "{answers['output_dir']}"
 checkpoint_dir = "./checkpoints"
 model_cache_dir = "./model_cache"
+projects_dir = "./projects"
+
+[filebase]
+access_key = "{answers['filebase_access_key']}"
+secret_key = "{answers['filebase_secret_key']}"
+bucket_name = "{answers['filebase_bucket']}"
+endpoint_url = "https://s3.filebase.com"
+enabled = {str(bool(answers['filebase_access_key'])).lower()}
+
+[project]
+auto_project_scan = true
+show_project_menu_on_start = true
+auto_save_interval = 0
+cloud_sync_retries = 3
 '''
     out_path.write_text(content, encoding="utf-8")
     print(f"Đã ghi cấu hình vào {out_path.resolve()}\n")

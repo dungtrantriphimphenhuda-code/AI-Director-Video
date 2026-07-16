@@ -528,10 +528,18 @@ def run_vision_analysis(cfg, preprocess_result: dict[str, Any], checkpoint_mgr=N
                         prefix="[vision] analyzing",
                         suffix=f"batch {i // batch_size + 1} ({len(chunk)} scene)",
                     )
-                    # Micro-checkpoint TỪNG SCENE (không phải copy cả list kết
-                    # quả) -> mỗi file chỉ chứa đúng 1 scene, resume được và
-                    # không tốn ổ đĩa/API tăng dần theo cấp số.
-                    if checkpoint_mgr is not None and done % micro_interval == 0:
+                    # Micro-checkpoint TỪNG SCENE ngay sau khi batch xong (không
+                    # phải copy cả list kết quả) -> mỗi file chỉ chứa đúng 1
+                    # scene, resume được và không tốn ổ đĩa/API tăng dần theo
+                    # cấp số. LUÔN lưu ngay sau mỗi batch (không throttle theo
+                    # micro_interval ở đây) vì việc ghi JSON cục bộ rất rẻ, còn
+                    # nếu throttle theo done % micro_interval thì khi
+                    # vision_batch_size không chia hết cho micro_interval, cả
+                    # 1 batch đã phân tích xong có thể bị bỏ hẳn không checkpoint
+                    # -> mất nhiều tiến độ hơn dự kiến nếu crash giữa chừng.
+                    # Việc throttle tần suất SYNC LÊN CLOUD (tốn API hơn nhiều)
+                    # đã được xử lý riêng trong CheckpointManager.save_micro().
+                    if checkpoint_mgr is not None:
                         for scene, analysis in zip(chunk, batch_results):
                             checkpoint_mgr.save_micro("vision", scene["scene_id"], analysis)
             else:

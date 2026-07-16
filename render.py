@@ -237,8 +237,22 @@ def run_render(cfg, storyboard: dict[str, Any], tts_result: dict[str, Any] | Non
     total_clips = len(storyboard["timeline"])
     micro_interval = cfg.get("processing.micro_checkpoint_interval", 1)
 
+    # Resume: bỏ qua các clip đã render xong ở lần chạy trước (checkpoint đã
+    # ghi VÀ file .mp4 tương ứng vẫn còn trên đĩa). Trước đây stage này chỉ
+    # GHI checkpoint mà không bao giờ đọc lại, nên bị ngắt giữa chừng sẽ luôn
+    # render lại từ đầu toàn bộ clip dù dữ liệu cũ vẫn còn nguyên.
+    already_done = checkpoint_mgr.list_micro_done("render") if checkpoint_mgr is not None else set()
+    if already_done:
+        print(f"[render] Tìm thấy {len(already_done)} clip đã render ở lần chạy trước, sẽ bỏ qua nếu file còn nguyên.")
+
     for idx, clip in enumerate(storyboard["timeline"], start=1):
         out_path = clips_dir / f"{clip['clip_id']}.mp4"
+
+        if clip["clip_id"] in already_done and out_path.exists():
+            clip_paths.append(out_path)
+            print_progress_bar(idx, total_clips, prefix="[render] clips (resumed)", suffix=clip["clip_id"])
+            continue
+
         render_clip(input_video, clip, tts_audio_map.get(clip["clip_id"]), out_path, max_speed_ratio)
         clip_paths.append(out_path)
         print_progress_bar(idx, total_clips, prefix="[render] clips", suffix=clip["clip_id"])

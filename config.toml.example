@@ -75,8 +75,40 @@ buffer_after_speech = 0.1
 min_clip_duration = 1.0
 max_speed_ratio = 4.0              # source_duration / output_duration tối đa cho phép
 
+# ---- Checkpoint frequency ----
+# micro_checkpoint_interval: lưu checkpoint mỗi N item (scene/batch)
+# Càng thấp = càng gần real-time. Mặc định: 1 = mỗi item.
+micro_checkpoint_interval = 1
+# auto_sync_cloud: tự động sync lên Filebase sau mỗi checkpoint
+auto_sync_cloud = true
+
 [paths]
 input_video = "./input/source.mp4"
 output_dir = "./output"
 checkpoint_dir = "./checkpoints"
 model_cache_dir = "./model_cache"
+# projects_dir: nơi lưu toàn bộ project
+projects_dir = "./projects"
+
+[filebase]
+# Thông tin xác thực lưu trữ Filebase (tương thích S3)
+# Access key để xác thực
+access_key = "PASTE_YOUR_FILEBASE_ACCESS_KEY_HERE"
+# Secret key để xác thực
+secret_key = "PASTE_YOUR_FILEBASE_SECRET_KEY_HERE"
+# Tên bucket — PHẢI DUY NHẤT TOÀN CỤC trên Filebase (giống S3), hãy đổi
+# thành tên riêng của bạn, đừng dùng nguyên giá trị mặc định.
+bucket_name = "ai-director-video"
+# Filebase S3 endpoint
+endpoint_url = "https://s3.filebase.com"
+# Bật/tắt tính năng sync cloud
+enabled = true
+
+[project]
+# Cấu hình mặc định cho quản lý project
+auto_project_scan = true
+show_project_menu_on_start = true
+# Khoảng thời gian tự lưu, tính bằng giây (0 = sau mỗi stage)
+auto_save_interval = 0
+# Số lần thử lại tối đa khi sync cloud thất bại
+cloud_sync_retries = 3

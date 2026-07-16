@@ -43,6 +43,14 @@ class ProjectManager:
             meta = self._load_project_meta(d)
             if meta is None:
                 meta = self._create_project_meta(d)
+            else:
+                # QUAN TRỌNG: dù đã có _project_meta.json (ghi lần đầu lúc
+                # create_project()), vẫn phải quét lại checkpoint/output mỗi
+                # lần liệt kê để cập nhật status/stages_completed thật. Nếu
+                # chỉ đọc thẳng file cache như trước, project sẽ hiện mãi ở
+                # trạng thái "new"/0 stage dù pipeline đã chạy xong nhiều
+                # bước — vì không có gì khiến cache đó được ghi đè lại.
+                meta = self._refresh_project_meta(d, meta)
             projects.append(meta)
         return projects
 
@@ -63,30 +71,20 @@ class ProjectManager:
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    def _create_project_meta(self, project_dir: Path) -> dict[str, Any]:
-        """Tạo metadata bằng cách quét thư mục project."""
-        meta = {
-            "project_id": project_dir.name,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "video_path": "",
-            "title": project_dir.name,
-            "status": "unknown",
-            "last_modified": "",
-            "stages_completed": [],
-            "total_stages": 7,
-        }
-
+    def _refresh_project_meta(self, project_dir: Path, meta: dict[str, Any]) -> dict[str, Any]:
+        """Cập nhật các trường suy ra được từ đĩa (status, stages_completed,
+        has_input_video, has_final_output, last_modified...) dựa trên
+        checkpoint/input/output thật hiện có, đè lên metadata cũ đã cache.
+        Các trường không thể suy ra từ đĩa (title, created_at...) được giữ
+        nguyên từ metadata cũ.
+        """
         # Quét checkpoint để xác định trạng thái
         ckpt_dir = project_dir / "checkpoints"
         if ckpt_dir.exists():
             stages = ["preprocess", "asr", "vision", "semantic_graph", "script", "tts", "render"]
-            completed = []
-            for s in stages:
-                if (ckpt_dir / f"{s}.json").exists():
-                    completed.append(s)
+            completed = [s for s in stages if (ckpt_dir / f"{s}.json").exists()]
             meta["stages_completed"] = completed
             meta["total_stages"] = len(stages)
-
             if len(completed) == len(stages):
                 meta["status"] = "completed"
             elif len(completed) > 0:
@@ -96,13 +94,9 @@ class ProjectManager:
 
         # Kiểm tra có config riêng cho project không
         cfg_file = project_dir / "config.toml"
-        if cfg_file.exists():
-            meta["has_config"] = True
+        meta["has_config"] = cfg_file.exists()
 
-        # Kiểm tra video gốc nằm bên trong project_dir/input/ (video luôn
-        # được copy vào đây khi tạo project — xem create_project() — nên khi
-        # quét lại 1 project có sẵn, đây là nguồn đáng tin cậy nhất, không
-        # phụ thuộc đường dẫn tuyệt đối bên ngoài có còn tồn tại hay không).
+        # Kiểm tra video gốc nằm bên trong project_dir/input/
         input_dir = project_dir / "input"
         if input_dir.exists():
             video_files = [
@@ -118,14 +112,11 @@ class ProjectManager:
         # Kiểm tra video đầu ra cuối cùng
         out_dir = project_dir / "output"
         if out_dir.exists():
-            deliverables = out_dir / "deliverables"
-            if deliverables.exists():
-                final = deliverables / "final_preview.mp4"
-                if final.exists():
-                    meta["has_final_output"] = True
-                    meta["status"] = "completed"
+            final = out_dir / "deliverables" / "final_preview.mp4"
+            if final.exists():
+                meta["has_final_output"] = True
+                meta["status"] = "completed"
 
-        # Lấy thời gian sửa đổi gần nhất
         meta["last_modified"] = time.strftime(
             "%Y-%m-%d %H:%M:%S",
             time.localtime(max(project_dir.stat().st_mtime, 0))
@@ -133,6 +124,20 @@ class ProjectManager:
 
         self._save_project_meta(project_dir, meta)
         return meta
+
+    def _create_project_meta(self, project_dir: Path) -> dict[str, Any]:
+        """Tạo metadata bằng cách quét thư mục project."""
+        meta = {
+            "project_id": project_dir.name,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "video_path": "",
+            "title": project_dir.name,
+            "status": "unknown",
+            "last_modified": "",
+            "stages_completed": [],
+            "total_stages": 7,
+        }
+        return self._refresh_project_meta(project_dir, meta)
 
     def create_project(self, project_id: str, video_path: str = "", title: str = "") -> Path:
         """Tạo thư mục project mới với đầy đủ cấu trúc con."""

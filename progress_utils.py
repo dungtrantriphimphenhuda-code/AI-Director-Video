@@ -140,6 +140,22 @@ def run_ffmpeg_with_progress(
     time_re = re.compile(r"out_time_ms=(\d+)")
     last_pct = -1
     assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    # Đọc stderr ở 1 thread riêng ĐỒNG THỜI với việc đọc stdout ở vòng lặp
+    # chính bên dưới. Trước đây stderr chỉ được đọc SAU KHI vòng lặp đọc
+    # stdout kết thúc — nếu ffmpeg in đủ nhiều cảnh báo ra stderr để làm đầy
+    # buffer pipe của hệ điều hành trong lúc tiến trình chính đang bận đọc
+    # stdout, cả 2 bên có thể treo lẫn nhau (ffmpeg chờ ghi, Python chờ đọc).
+    stderr_chunks: list[str] = []
+
+    def _drain_stderr() -> None:
+        for line in proc.stderr:  # type: ignore[union-attr]
+            stderr_chunks.append(line)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
     for line in proc.stdout:
         m = time_re.search(line)
         if not m:
@@ -152,7 +168,8 @@ def run_ffmpeg_with_progress(
                 suffix=f"{current_sec:5.1f}s/{total_duration:.1f}s",
             )
             last_pct = pct
-    stderr_output = proc.stderr.read() if proc.stderr else ""
+    stderr_thread.join()
+    stderr_output = "".join(stderr_chunks)
     returncode = proc.wait()
     if last_pct < 100:
         print_progress_bar(total_duration, total_duration, prefix=f"[{label}]", suffix="hoàn tất")
