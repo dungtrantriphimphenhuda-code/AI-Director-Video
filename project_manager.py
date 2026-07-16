@@ -71,6 +71,22 @@ class ProjectManager:
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    # BUGFIX: trước đây 1 stage được coi là "đã xong" chỉ vì có file checkpoint
+    # JSON, dù file output thật của stage đó (audio.wav, vision_analysis.json,
+    # v.v.) có thể đã bị mất (vd tải project về từ cloud nhưng chỉ checkpoint
+    # được đồng bộ, không có file thật đi kèm). Kết quả: menu hiển thị "1/7 đã
+    # xong" trong khi thực tế chạy tiếp sẽ crash ngay vì thiếu file. Giờ kiểm
+    # tra thêm file output thật trước khi tính 1 stage là "đã xong".
+    _REQUIRED_OUTPUTS = {
+        "preprocess": ["output/pipeline/audio.wav", "output/pipeline/scenes.json"],
+        "asr": ["output/pipeline/asr_timeline.json"],
+        "vision": ["output/pipeline/vision_analysis.json"],
+        "semantic_graph": ["output/pipeline/semantic_blocks.json"],
+        "script": ["output/pipeline/storyboard.json"],
+        "tts": ["output/pipeline/voiceover.mp3"],
+        "render": ["output/deliverables/final_preview.mp4"],
+    }
+
     def _refresh_project_meta(self, project_dir: Path, meta: dict[str, Any]) -> dict[str, Any]:
         """Cập nhật các trường suy ra được từ đĩa (status, stages_completed,
         has_input_video, has_final_output, last_modified...) dựa trên
@@ -82,10 +98,26 @@ class ProjectManager:
         ckpt_dir = project_dir / "checkpoints"
         if ckpt_dir.exists():
             stages = ["preprocess", "asr", "vision", "semantic_graph", "script", "tts", "render"]
-            completed = [s for s in stages if (ckpt_dir / f"{s}.json").exists()]
+            completed = []
+            incomplete_but_checkpointed = []
+            for s in stages:
+                has_ckpt = (ckpt_dir / f"{s}.json").exists()
+                if not has_ckpt:
+                    continue
+                required = self._REQUIRED_OUTPUTS.get(s, [])
+                missing = [r for r in required if not (project_dir / r).exists()]
+                if missing:
+                    incomplete_but_checkpointed.append(s)
+                else:
+                    completed.append(s)
             meta["stages_completed"] = completed
             meta["total_stages"] = len(stages)
-            if len(completed) == len(stages):
+            meta["stages_checkpoint_only"] = incomplete_but_checkpointed
+            if incomplete_but_checkpointed:
+                # Có checkpoint nhưng thiếu file thật -> cảnh báo rõ ràng thay
+                # vì âm thầm hiện "đã xong" rồi để pipeline crash sau đó.
+                meta["status"] = "needs_recompute"
+            elif len(completed) == len(stages):
                 meta["status"] = "completed"
             elif len(completed) > 0:
                 meta["status"] = "in_progress"
@@ -262,6 +294,7 @@ class ProjectManager:
                 "new": "NEW",
                 "unknown": "???",
                 "cloud_only": "CLD",
+                "needs_recompute": "WARN",
             }.get(status, "???")
             print(f"  {i:<4} {pid:<30} {status_icon:<15} {completed}/{total:<10} {modified:<20} {source:<10}")
 

@@ -366,15 +366,56 @@ def run_pipeline_on_project(cfg, pm: ProjectManager, project_id: str, filebase: 
     stages = ["preprocess", "asr", "vision", "semantic_graph", "script", "tts", "render"]
     tracker = StepTracker(stages)
 
+    # BUGFIX: checkpoint JSON được tự động đẩy lên cloud gần như real-time
+    # (xem checkpoint.py:_sync_to_cloud), NHƯNG file output thật của stage đó
+    # (audio.wav, vision_analysis.json, voiceover.mp3, final_preview.mp4...)
+    # trước đây chỉ được đồng bộ lên cloud khi người dùng bấm menu "5. Đồng bộ"
+    # hoặc khi TOÀN BỘ pipeline chạy xong. Nếu phiên chạy bị ngắt giữa chừng
+    # (mất mạng, hết token, máy cloud restart...) sau khi 1 stage xong nhưng
+    # trước khi kịp đồng bộ, cloud sẽ có checkpoint nói "đã xong" trong khi
+    # KHÔNG có file thật đi kèm -> tải project về máy khác sẽ crash ngay khi
+    # đọc file không tồn tại (đã xảy ra thật với audio.wav).
+    #
+    # Danh sách file output "bắt buộc phải có" cho mỗi stage, dùng để:
+    #   1) không tin checkpoint "đã xong" nếu file thật đã biến mất -> tự
+    #      chạy lại stage đó thay vì crash ở stage sau.
+    #   2) biết cần đồng bộ project lên cloud sau khi stage nào đó chạy THẬT
+    #      (không phải bị skip), để checkpoint trên cloud luôn đi kèm dữ liệu
+    #      thật, không bao giờ "nói dối" nữa.
+    required_outputs = {
+        "preprocess": ["output/pipeline/audio.wav", "output/pipeline/scenes.json"],
+        "asr": ["output/pipeline/asr_timeline.json"],
+        "vision": ["output/pipeline/vision_analysis.json"],
+        "semantic_graph": ["output/pipeline/semantic_blocks.json"],
+        "script": ["output/pipeline/storyboard.json"],
+        "tts": ["output/pipeline/voiceover.mp3"],
+        "render": ["output/deliverables/final_preview.mp4", "output/deliverables/narration_subtitle.srt"],
+    }
+
+    def _missing_outputs(stage: str) -> list[str]:
+        return [rel for rel in required_outputs.get(stage, []) if not (project_dir / rel).exists()]
+
     def run_stage(stage: str, compute_fn, has_checkpoint: bool = True):
         tracker.start(stage)
-        if has_checkpoint and ckpt.is_done(stage):
+        missing = _missing_outputs(stage) if has_checkpoint else []
+        if has_checkpoint and ckpt.is_done(stage) and not missing:
             result = ckpt.load(stage)
             print(f"[main] Bỏ qua {stage} (đã có checkpoint).")
             tracker.finish(stage, skipped=True)
         else:
+            if has_checkpoint and ckpt.is_done(stage) and missing:
+                print(f"[main] CẢNH BÁO: checkpoint '{stage}' nói đã xong nhưng thiếu file "
+                      f"output thật ({', '.join(missing)}) — chạy lại stage này.")
             result = compute_fn()
             tracker.finish(stage)
+            # Đồng bộ NGAY project thật (không chỉ checkpoint JSON) lên cloud
+            # sau mỗi stage chạy thật, để cloud không bao giờ có checkpoint
+            # "mồ côi" (không có file thật đi kèm) như đã xảy ra trước đây.
+            if filebase and cfg.get("filebase.enabled", True) and auto_sync_cloud:
+                print(f"[filebase] Đồng bộ output của '{stage}' lên cloud...")
+                sync_result = pm.sync_to_cloud(project_id)
+                if sync_result.get("error") or sync_result.get("aborted"):
+                    print(f"[filebase] CẢNH BÁO: đồng bộ '{stage}' lên cloud thất bại: {sync_result}")
         return result
 
     preprocess_result = run_stage("preprocess", lambda: preprocess.run_preprocess(cfg, ckpt))
@@ -382,6 +423,12 @@ def run_pipeline_on_project(cfg, pm: ProjectManager, project_id: str, filebase: 
     # dùng (có thể vừa được người dùng nhập lại) -> đảm bảo nó nằm trong
     # project_dir/input/ để lần sync sau không bị thiếu.
     _ensure_video_in_project(cfg, project_dir, meta, pm)
+    # _ensure_video_in_project() có thể vừa copy 1 video mới vào input/ SAU
+    # khi run_stage("preprocess", ...) đã đồng bộ lên cloud lần đầu (nếu
+    # preprocess chạy thật) -> đồng bộ thêm 1 lần nữa để đảm bảo video luôn
+    # đi kèm, không phải chờ tới stage kế tiếp chạy thật mới được đồng bộ.
+    if filebase and cfg.get("filebase.enabled", True) and auto_sync_cloud:
+        pm.sync_to_cloud(project_id)
 
     asr_timeline = run_stage("asr", lambda: asr.run_asr(cfg, preprocess_result, ckpt))
     vision_analysis = run_stage("vision", lambda: vision.run_vision_analysis(cfg, preprocess_result, ckpt))

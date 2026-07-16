@@ -10,6 +10,7 @@ Giao thức: tương thích S3 API
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -251,6 +252,14 @@ class FilebaseStorage:
         except Exception:
             return False
 
+    def _remote_size_and_etag(self, remote_key: str) -> tuple[int, str] | None:
+        """Lấy (kích thước, ETag) của 1 object trên Filebase, None nếu chưa tồn tại."""
+        try:
+            resp = self.client.head_object(Bucket=self.bucket_name, Key=remote_key)
+            return resp.get("ContentLength"), str(resp.get("ETag", "")).strip('"')
+        except Exception:
+            return None
+
     def _remote_size(self, remote_key: str) -> int | None:
         """Lấy kích thước (byte) của 1 object trên Filebase, None nếu chưa tồn tại."""
         try:
@@ -258,6 +267,14 @@ class FilebaseStorage:
             return resp.get("ContentLength")
         except Exception:
             return None
+
+    @staticmethod
+    def _local_md5(path: Path) -> str:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
     def upload_project(self, project_dir: Path, project_id: str, max_workers: int = 16) -> dict[str, Any]:
         """Upload toàn bộ thư mục project (bao gồm input/ chứa video gốc,
@@ -269,6 +286,16 @@ class FilebaseStorage:
         đổi giữa các lần sync, ta so kích thước với bản đã có trên cloud
         (head_object) và bỏ qua nếu trùng, để tránh upload lại hàng GB không
         cần thiết mỗi lần đồng bộ.
+
+        BUGFIX: chỉ so KÍCH THƯỚC là không đủ — 2 file khác nội dung nhưng
+        tình cờ trùng byte-size (khá dễ xảy ra với các file JSON/keyframe nhỏ,
+        vd asr_timeline.json trước và sau khi sửa 1 câu thoại có thể trùng
+        size) sẽ bị coi là "đã có sẵn" và KHÔNG được upload bản mới, khiến
+        cloud giữ mãi bản cũ mà không ai biết. Với file NHỎ (dưới ngưỡng
+        HEAVY_FILE_THRESHOLD_BYTES), khi size trùng ta so thêm MD5 cục bộ với
+        ETag trên Filebase trước khi quyết định bỏ qua. Với file NẶNG (video
+        gốc, hiếm đổi, hash cả GB mỗi lần sync sẽ rất chậm), vẫn chỉ so size
+        như cũ — đây là đánh đổi có chủ đích, không phải bug.
 
         Upload SONG SONG (giống download_project()) vì project thường có
         hàng ngàn file keyframe nhỏ — tuần tự từng file sẽ bị chặn bởi độ
@@ -304,9 +331,21 @@ class FilebaseStorage:
         def _job(local_file: Path, remote_key: str) -> tuple[str, str]:
             """Trả về (remote_key, 'uploaded'|'skipped'|'error')."""
             local_size = local_file.stat().st_size
-            remote_size = self._remote_size(remote_key)
-            if remote_size is not None and remote_size == local_size:
-                return remote_key, "skipped"
+            remote = self._remote_size_and_etag(remote_key)
+            if remote is not None:
+                remote_size, remote_etag = remote
+                if remote_size == local_size:
+                    if local_size >= HEAVY_FILE_THRESHOLD_BYTES:
+                        # File nặng: chấp nhận đánh đổi, chỉ so size (xem docstring).
+                        return remote_key, "skipped"
+                    # File nhỏ/vừa: multipart ETag (chứa '-') không phải MD5
+                    # thuần -> không so được, đành upload lại cho an toàn.
+                    if "-" not in remote_etag:
+                        try:
+                            if self._local_md5(local_file) == remote_etag:
+                                return remote_key, "skipped"
+                        except OSError:
+                            pass
             ok = self._upload_file(local_file, remote_key)
             return remote_key, ("uploaded" if ok else "error")
 
