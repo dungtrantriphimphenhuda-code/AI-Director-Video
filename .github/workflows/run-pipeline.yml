@@ -1,0 +1,80 @@
+name: Run AI Director Video Pipeline
+
+# ---------------------------------------------------------------------------
+# KHI NÀO CHẠY:
+#   1. push        -> mỗi khi bạn push code lên nhánh main
+#   2. workflow_dispatch -> bấm tay ở tab "Actions" trên GitHub
+#   3. schedule    -> tự động mỗi ngày lúc 8:00 sáng giờ Việt Nam
+#      (cron chạy theo giờ UTC: 8:00 ICT = 01:00 UTC -> "0 1 * * *")
+#
+# MỖI LẦN CHẠY: tự động chọn project MỚI NHẤT trong số project CHƯA hoàn
+# thành (xem ci_run_latest_project.py) và chạy tiếp pipeline từ checkpoint
+# gần nhất — không cần bạn chọn tay project nào.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 1 * * *"
+
+# Không cho 2 lần chạy chồng lên nhau (vd push đúng lúc lịch 8h sáng chạy) —
+# xếp hàng chạy tuần tự để tránh 2 job cùng ghi đè 1 project trên cloud.
+concurrency:
+  group: ai-director-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    # Giới hạn cứng của GitHub Actions là 6 giờ/job (360 phút). Đặt 350 để
+    # job tự dừng sớm hơn 1 chút, có thời gian in log gọn gàng thay vì bị
+    # GitHub ngắt đột ngột.
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cài Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cài FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg gettext-base
+
+      - name: Cài thư viện Python
+        run: pip install -r requirements.txt
+
+      - name: Tạo config.toml từ secrets
+        env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CLOUD_ACCESS_KEY: ${{ secrets.CLOUD_ACCESS_KEY }}
+          CLOUD_SECRET_KEY: ${{ secrets.CLOUD_SECRET_KEY }}
+          CLOUD_BUCKET_NAME: ${{ secrets.CLOUD_BUCKET_NAME }}
+          CLOUD_ENDPOINT_URL: ${{ secrets.CLOUD_ENDPOINT_URL }}
+          CLOUD_REGION_NAME: ${{ secrets.CLOUD_REGION_NAME }}
+          CLOUD_ADDRESSING_STYLE: ${{ secrets.CLOUD_ADDRESSING_STYLE }}
+        run: |
+          envsubst < config.ci.toml.template > config.toml
+          echo "Đã tạo config.toml (không in nội dung ra log vì chứa secret)."
+
+      - name: Chạy pipeline (tự chọn project mới nhất chưa xong)
+        run: python ci_run_latest_project.py
+
+      - name: Upload log / output làm artifact (nếu có)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-output-${{ github.run_id }}
+          path: |
+            projects/**/output/deliverables/**
+            projects/**/output/pipeline/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+          
