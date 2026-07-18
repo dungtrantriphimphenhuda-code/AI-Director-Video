@@ -53,7 +53,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg gettext-base
 
       - name: Cài thư viện Python
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          # transformers v5.x đổi cách init model nội bộ (yêu cầu post_init()
+          # set all_tied_weights_keys) -> code custom trust_remote_code của
+          # moondream2 (HfMoondream) chưa theo kịp, load model sẽ vỡ với lỗi
+          # "'HfMoondream' object has no attribute 'all_tied_weights_keys'".
+          # Ép lại về nhánh 4.x cho tới khi moondream2/transformers vá lỗi này.
+          pip install "transformers>=4.57.0,<5.0.0"
 
       - name: Kiểm tra config.toml đã có trong repo
         run: |
