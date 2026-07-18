@@ -17,13 +17,19 @@ on:
     branches: [main]
   workflow_dispatch: {}
   schedule:
+    # Lưới an toàn: nếu vì lý do gì đó chuỗi tự-trigger bên dưới bị đứt
+    # (hết quota phút Actions/tháng, GitHub lỗi...), vẫn có 1 lần chạy/ngày.
     - cron: "0 1 * * *"
 
-# Không cho 2 lần chạy chồng lên nhau (vd push đúng lúc lịch 8h sáng chạy) —
+# Không cho 2 lần chạy chồng lên nhau (vd push đúng lúc job tự-trigger chạy) —
 # xếp hàng chạy tuần tự để tránh 2 job cùng ghi đè 1 project trên cloud.
 concurrency:
   group: ai-director-pipeline
   cancel-in-progress: false
+
+permissions:
+  actions: write   # cần để step "trigger lại" gọi được workflow_dispatch
+  contents: read
 
 jobs:
   run-pipeline:
@@ -59,7 +65,47 @@ jobs:
           echo "Đã tìm thấy config.toml."
 
       - name: Chạy pipeline (tự chọn project mới nhất chưa xong)
-        run: python ci_run_latest_project.py
+        env:
+          # Tắt progress bar tải model / cảnh báo verbose của HF & transformers
+          # (moondream tải qua HF) -> đỡ rác log.
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+          TRANSFORMERS_VERBOSITY: "error"
+          TOKENIZERS_PARALLELISM: "false"
+        run: |
+          # Toàn bộ log của lệnh này được gom vào 1 khối gập lại trên GitHub
+          # Actions UI (bấm mới bung ra) bằng ::group::/::endgroup::, KHÔNG
+          # cần sửa file .py nào cả.
+          #
+          # Đồng thời lọc bớt các dòng progress bar/heartbeat lặp lại bằng awk:
+          # - Pipeline tự in progress bar dùng \r (không xuống dòng thật) ->
+          #   `tr '\r' '\n'` tách chúng thành từng dòng riêng để lọc được.
+          # - Với dòng có dạng "...NN.N% (a/b)...": chỉ giữ lại khi % vượt
+          #   thêm 1 mốc 5% so với lần in trước CỦA CÙNG PREFIX (chữ trước
+          #   dấu "[" đầu tiên, vd "[vision]", "[tts]"...).
+          # - Với dòng heartbeat "vẫn đang chạy... Ns" (không có %): chỉ giữ
+          #   1 trong mỗi 6 dòng liên tiếp cùng nhãn (heartbeat mặc định in
+          #   mỗi 5s -> giữ lại tương đương mỗi ~30s).
+          echo "::group::Pipeline output (bấm để xem chi tiết)"
+          python ci_run_latest_project.py 2>&1 | tr '\r' '\n' | awk '
+            {
+              line = $0
+              if (match(line, /[0-9]+(\.[0-9]+)?%/)) {
+                pct = substr(line, RSTART, RLENGTH - 1) + 0
+                split(line, arr, "[")
+                key = "pct:" arr[1]
+                bucket = int(pct / 5)
+                if (pct < 100 && bucket == last[key]) next
+                last[key] = bucket
+              } else if (line ~ /vẫn đang chạy/) {
+                split(line, arr, "]")
+                key = "hb:" arr[1]
+                cnt[key]++
+                if (cnt[key] % 6 != 1) next
+              }
+              print line
+            }
+          ' | tee pipeline_run.log
+          echo "::endgroup::"
 
       - name: Upload log / output làm artifact (nếu có)
         if: always()
@@ -71,3 +117,18 @@ jobs:
             projects/**/output/pipeline/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Trigger job kế tiếp nếu còn project chưa xong
+        # if: always() -> chạy kể cả khi job bị GitHub huỷ do vượt timeout-minutes,
+        # hoặc bước chạy pipeline ở trên lỗi. Nhờ concurrency group phía trên,
+        # job mới sẽ CHỜ job hiện tại kết thúc hẳn rồi mới chạy, không chồng lấn.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if grep -q "Không có project nào đang chờ xử lý" pipeline_run.log 2>/dev/null; then
+            echo "Không còn project nào đang chờ -> không trigger job kế tiếp."
+          else
+            echo "Còn project chưa xong (hoặc bị cắt ngang do timeout) -> trigger job kế tiếp."
+            gh workflow run run-pipeline.yml --ref "${{ github.ref_name }}"
+          fi
