@@ -17,6 +17,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,12 @@ class CheckpointManager:
         # save_micro() kế tiếp, và bắt buộc phải "trả hết nợ" khi
         # flush_pending_syncs() được gọi ở cuối mỗi stage.
         self._pending_syncs: dict[str, Path] = {}  # remote_relative -> local_path
+        # BUGFIX: save_micro()/_sync_to_cloud() không thread-safe trước đây vì
+        # luôn được gọi TUẦN TỰ từ 1 coroutine/luồng duy nhất. Từ khi tts.py
+        # chạy song song nhiều luồng qua asyncio.to_thread(), nhiều luồng có
+        # thể gọi save_micro() cùng lúc -> lock để tránh 2 luồng cùng
+        # đọc/ghi self._pending_syncs / bộ đếm cùng lúc (race condition).
+        self._lock = threading.Lock()
 
         # Register signal handlers for graceful shutdown
         self._original_sigint = signal.getsignal(signal.SIGINT)
@@ -168,7 +175,8 @@ class CheckpointManager:
             json.dump(wrapper, f, ensure_ascii=False, indent=2)
         tmp.replace(p)
 
-        self._micro_save_count += 1
+        with self._lock:
+            self._micro_save_count += 1
 
         # Trước khi làm gì mới, luôn cố "trả nợ" các lần sync đã thất bại
         # trước đó -- nếu không làm bước này, 1 lần lỗi mạng thoáng qua sẽ
@@ -182,14 +190,16 @@ class CheckpointManager:
             # item RẺ (vd rất nhiều item nhỏ trong thời gian ngắn). Ngay cả
             # khi bỏ qua sync ở đây, item vẫn đã có trong _pending_syncs nếu
             # có sự cố, và sẽ được flush_pending_syncs() dọn sạch cuối stage.
-            should_sync_now = (time.time() - self._last_save_time) >= self.auto_save_interval
-            if not should_sync_now:
-                self._pending_syncs[f"checkpoints/{stage}_{item_id}.json"] = p
-                return
+            with self._lock:
+                should_sync_now = (time.time() - self._last_save_time) >= self.auto_save_interval
+                if not should_sync_now:
+                    self._pending_syncs[f"checkpoints/{stage}_{item_id}.json"] = p
+                    return
 
         ok = self._sync_to_cloud(p, f"checkpoints/{stage}_{item_id}.json")
         if ok:
-            self._last_save_time = time.time()
+            with self._lock:
+                self._last_save_time = time.time()
 
     def load(self, stage: str) -> Any:
         """Load stage checkpoint data."""
@@ -255,13 +265,18 @@ class CheckpointManager:
         ok = False
         try:
             remote_key = f"projects/{self.project_id}/{remote_relative}"
+            # Gọi mạng THẬT SỰ nằm ngoài lock -- nếu khoá ở đây, 40 luồng tts
+            # song song sẽ bị dồn về chạy tuần tự ngay tại bước upload, phá
+            # hỏng mục đích chạy song song. Lock chỉ cần bảo vệ chỗ đọc/ghi
+            # self._pending_syncs (thao tác dict, rất nhanh) bên dưới.
             ok = bool(self.cloud._upload_file(local_path, remote_key))
         except Exception:
             ok = False
-        if ok:
-            self._pending_syncs.pop(remote_relative, None)
-        else:
-            self._pending_syncs[remote_relative] = local_path
+        with self._lock:
+            if ok:
+                self._pending_syncs.pop(remote_relative, None)
+            else:
+                self._pending_syncs[remote_relative] = local_path
         return ok
 
     def _retry_pending_syncs(self) -> None:
@@ -271,13 +286,18 @@ class CheckpointManager:
         mạng thoáng qua tự phục hồi càng sớm càng tốt, không phải đợi tới
         cuối stage mới phát hiện ra là đang "nợ" cloud.
         """
-        if not self._pending_syncs or self.cloud is None or not self.auto_sync_cloud:
+        if self.cloud is None or not self.auto_sync_cloud:
             return
-        for remote_relative, local_path in list(self._pending_syncs.items()):
+        with self._lock:
+            snapshot = list(self._pending_syncs.items())
+        if not snapshot:
+            return
+        for remote_relative, local_path in snapshot:
             if not local_path.exists():
                 # File cục bộ không còn (hiếm khi xảy ra) -> bỏ khỏi hàng đợi,
                 # không có gì để upload lại nữa.
-                self._pending_syncs.pop(remote_relative, None)
+                with self._lock:
+                    self._pending_syncs.pop(remote_relative, None)
                 continue
             self._sync_to_cloud(local_path, remote_relative)
 
@@ -299,11 +319,14 @@ class CheckpointManager:
             return True
         for attempt in range(1, max_retries + 1):
             self._retry_pending_syncs()
-            if not self._pending_syncs:
+            with self._lock:
+                still_pending = bool(self._pending_syncs)
+            if not still_pending:
                 return True
             if attempt < max_retries:
                 time.sleep(retry_wait_sec)
-        remaining = len(self._pending_syncs)
+        with self._lock:
+            remaining = len(self._pending_syncs)
         print(f"[checkpoint] CẢNH BÁO: {remaining} checkpoint vẫn CHƯA lên được cloud sau "
               f"{max_retries} lần thử (có thể do mất mạng). Dữ liệu vẫn AN TOÀN trên đĩa cục bộ, "
               f"nhưng sẽ mất nếu máy/Colab bị reset trước khi bạn chạy lại hoặc bấm "

@@ -27,6 +27,11 @@ voice = "vi-VN-HoangMinhNeural"
 rate = "+0%"
 volume = "+0%"
 pitch = "+0Hz"
+# Số câu tổng hợp song song cùng lúc. edge-tts ổn định, không rate-limit
+# cứng như API trả phí -> chạy song song thay vì tuần tự giúp nhanh hơn
+# nhiều lần với storyboard có nhiều câu. 40 là mức an toàn thực tế (đủ
+# nhanh, ít khi bị timeout/nghẽn do mở quá nhiều kết nối cùng lúc).
+max_concurrency = 40
 
 [processing]
 # ---- ASR (faster-whisper) ----

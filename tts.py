@@ -23,10 +23,24 @@ import edge_tts
 from progress_utils import print_progress_bar, run_ffmpeg_with_progress
 
 
-async def _synthesize_one(text: str, voice: str, rate: str, volume: str, pitch: str, out_path: Path) -> None:
-    """Sinh 1 file audio cho 1 câu narration bằng edge-tts."""
-    communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
-    await communicate.save(str(out_path))
+async def _synthesize_one_with_retry(
+    text: str, voice: str, rate: str, volume: str, pitch: str, out_path: Path,
+    max_retries: int = 3,
+) -> None:
+    """Sinh 1 file audio, tự retry nếu edge-tts báo lỗi thoáng qua (mất mạng
+    tạm thời, timeout...). edge-tts nhìn chung rất ổn định, lỗi thường tự
+    qua khi thử lại ngay, không cần backoff dài như API có rate-limit thật."""
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+            await communicate.save(str(out_path))
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                await asyncio.sleep(1.0 * attempt)
+    raise RuntimeError(f"edge-tts thất bại sau {max_retries} lần thử: {last_err}") from last_err
 
 
 async def _synthesize_all(
@@ -37,54 +51,69 @@ async def _synthesize_all(
     pitch: str,
     out_dir: Path,
     checkpoint_mgr=None,
+    max_concurrency: int = 40,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
     total = len(sentences)
+    # Danh sách kết quả theo ĐÚNG thứ tự sentences gốc (quan trọng: mix_voiceover_track
+    # ghép audio dựa vào thứ tự này khớp với timeline) dù các câu hoàn thành
+    # không theo thứ tự khi chạy song song.
+    paths: list[Path | None] = [None] * total
 
     # --- Resume: bỏ qua câu đã tổng hợp xong ở lần chạy trước ---
-    # Đây là bước dễ bị ngắt nhất (gọi mạng tuần tự cho từng câu), nên phải
-    # checkpoint NGAY sau mỗi câu, không phải đợi xong hết vòng lặp mới ghi.
     done_ids: set[str] = set()
     if checkpoint_mgr is not None:
         done_ids = checkpoint_mgr.list_micro_done("tts")
 
-    n_skipped = 0
-    for i, sent in enumerate(sentences, start=1):
+    # edge-tts rất ổn định + không có rate-limit cứng như các API trả phí ở
+    # vision.py, nên chạy SONG SONG nhiều câu cùng lúc thay vì tuần tự từng
+    # câu như trước -- giới hạn bằng semaphore để tránh mở quá nhiều kết nối
+    # cùng lúc (an toàn thực tế: ~40 luồng đồng thời).
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    progress = {"done": 0, "skipped": 0}
+
+    async def _run_one(idx: int, sent: dict[str, Any]) -> None:
         clip_id = sent["clip_id"]
         out_path = out_dir / f"{clip_id}.mp3"
 
         if clip_id in done_ids and out_path.exists():
-            # Đã tổng hợp xong ở lần chạy trước và file audio vẫn còn -> bỏ qua.
-            paths.append(out_path)
-            n_skipped += 1
-            print_progress_bar(i, total, prefix="[tts] synthesizing", suffix=f"{clip_id} (cached)")
-            continue
+            paths[idx] = out_path
+            progress["done"] += 1
+            progress["skipped"] += 1
+            print_progress_bar(progress["done"], total, prefix="[tts] synthesizing",
+                                suffix=f"{clip_id} (cached)")
+            return
 
-        # edge-tts qua mạng — chạy tuần tự để tránh bị rate-limit/timeout hàng loạt.
-        await _synthesize_one(sent["sentence"], voice, rate, volume, pitch, out_path)
-        paths.append(out_path)
-        print_progress_bar(i, total, prefix="[tts] synthesizing", suffix=clip_id)
+        async with semaphore:
+            await _synthesize_one_with_retry(sent["sentence"], voice, rate, volume, pitch, out_path)
 
-        # Micro-checkpoint NGAY sau khi câu này xong — đây chính là chỗ dễ bị
-        # ngắt mạng/treo nhất trong cả pipeline, nên không thể đợi tổng hợp
-        # xong hết mới ghi checkpoint (nếu vậy bị ngắt giữa chừng sẽ mất sạch,
-        # y như không có checkpoint).
+        paths[idx] = out_path
+        progress["done"] += 1
+        print_progress_bar(progress["done"], total, prefix="[tts] synthesizing", suffix=clip_id)
+
+        # Micro-checkpoint NGAY sau khi câu này xong. checkpoint_mgr.save_micro()
+        # gọi boto3 đồng bộ (chặn) để upload cloud -> đẩy sang thread riêng
+        # bằng asyncio.to_thread() để KHÔNG chặn event loop, giữ đúng nhiều
+        # luồng edge-tts chạy song song thật sự thay vì bị nghẽn cổ chai ở
+        # bước ghi checkpoint (CheckpointManager đã được thêm lock để an
+        # toàn khi nhiều luồng gọi save_micro() đồng thời -- xem checkpoint.py).
         if checkpoint_mgr is not None:
-            checkpoint_mgr.save_micro("tts", clip_id, {
+            await asyncio.to_thread(checkpoint_mgr.save_micro, "tts", clip_id, {
                 "clip_id": clip_id,
                 "audio_path": str(out_path),
             })
 
+    await asyncio.gather(*(_run_one(i, sent) for i, sent in enumerate(sentences)))
+
     if checkpoint_mgr is not None and sentences:
         # Lưới an toàn cuối stage: đảm bảo MỌI câu đã tổng hợp trong lần
-        # chạy này thực sự lên cloud (không chỉ câu cuối như trước).
+        # chạy này thực sự lên cloud.
         checkpoint_mgr.flush_pending_syncs()
 
-    if n_skipped:
-        print(f"[tts] Bỏ qua {n_skipped}/{total} câu đã tổng hợp sẵn (resume từ checkpoint).")
+    if progress["skipped"]:
+        print(f"[tts] Bỏ qua {progress['skipped']}/{total} câu đã tổng hợp sẵn (resume từ checkpoint).")
 
-    return paths
+    return paths  # type: ignore[return-value]
 
 
 def _ffprobe_duration(path: Path) -> float:
@@ -159,11 +188,14 @@ def run_tts(cfg, storyboard: dict[str, Any], checkpoint_mgr=None) -> dict[str, A
     rate = cfg.get("tts.rate", "+0%")
     volume = cfg.get("tts.volume", "+0%")
     pitch = cfg.get("tts.pitch", "+0Hz")
+    max_concurrency = cfg.get("tts.max_concurrency", 40)
 
     sentences = storyboard["timeline"]
-    print(f"[tts] Synthesizing {len(sentences)} câu bằng edge-tts (voice={voice})...")
+    print(f"[tts] Synthesizing {len(sentences)} câu bằng edge-tts (voice={voice}, "
+          f"song song tối đa {max_concurrency} luồng)...")
     clip_audio_paths = asyncio.run(
-        _synthesize_all(sentences, voice, rate, volume, pitch, tts_dir, checkpoint_mgr=checkpoint_mgr)
+        _synthesize_all(sentences, voice, rate, volume, pitch, tts_dir,
+                         checkpoint_mgr=checkpoint_mgr, max_concurrency=max_concurrency)
     )
 
     # Đo lại thời lượng thực tế TTS để phát hiện lệch lớn so với output_duration ước tính.
