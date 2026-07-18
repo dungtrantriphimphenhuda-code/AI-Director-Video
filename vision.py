@@ -567,6 +567,11 @@ def run_vision_analysis(cfg, preprocess_result: dict[str, Any], checkpoint_mgr=N
                         checkpoint_mgr.save_micro("vision", scene_id, analysis)
         finally:
             analyzer.unload()
+            # Lưới an toàn cuối stage: đảm bảo MỌI micro-checkpoint vision đã
+            # tạo ra trong lần chạy này thực sự nằm trên cloud, không chỉ
+            # nằm trên đĩa tạm của Colab (xem docstring flush_pending_syncs).
+            if checkpoint_mgr is not None:
+                checkpoint_mgr.flush_pending_syncs()
     else:
         print("[vision] Tất cả scene đã có checkpoint, bỏ qua bước phân tích.")
 

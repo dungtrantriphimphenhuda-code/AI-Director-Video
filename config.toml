@@ -37,7 +37,7 @@ asr_language = "vi"               # language code, leave empty "" for auto-detec
 
 # ---- Vision ----
 # "local" (needs GPU) | "cerebras" | "mistral" (recommended for no-GPU machines)
-vision_backend = "mistral"
+vision_backend = "local"
 cerebras_vision_model = "gemma-4-31b"
 cerebras_vision_max_images = 2
 cerebras_vision_rpm = 5

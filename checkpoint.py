@@ -43,13 +43,27 @@ class CheckpointManager:
         # nhất, bất kể số lần save_micro() đã gọi.
         self.auto_save_interval = max(0, auto_save_interval)
         self._save_count = 0
-        # Đếm riêng số lần save_micro() được gọi, dùng để throttle sync lên
-        # cloud (KHÔNG dùng chung _save_count — biến đó chỉ tăng trong
-        # save(), thường gọi 1 lần/stage nên gần như luôn = 0 -> throttle
-        # bằng _save_count sẽ vô tình sync MỌI micro-checkpoint, ngược ý định
-        # "mỗi 5 lần" ghi trong docstring).
+        # Đếm riêng số lần save_micro() được gọi, dùng cho auto_save_interval
+        # (throttle THEO THỜI GIAN, tuỳ chọn — xem save_micro()).
         self._micro_save_count = 0
         self._last_save_time = time.time()
+
+        # BUGFIX (nghiêm trọng): trước đây _sync_to_cloud() nuốt luôn kết quả
+        # thất bại (không retry, không log lại), và save_micro() chỉ sync
+        # theo bội số cố định "mỗi 5 lần gọi" bất kể mỗi item tốn bao nhiêu
+        # công GPU/API thật để tạo ra. Hậu quả thực tế: 1 phiên vision chạy
+        # xong 689/1609 scene cục bộ, nhưng cloud chỉ có 273/1609 — khi
+        # Colab bị ngắt (ổ đĩa /content là bộ nhớ tạm, mất sạch khi restart),
+        # 416 scene đã tốn API/GPU bị mất trắng vì chưa kịp rơi vào bội số
+        # sync hoặc vì 1 lần upload lỗi không bao giờ được thử lại.
+        #
+        # Sửa: mỗi micro-checkpoint giờ LUÔN được thử sync ngay (không throttle
+        # theo số lần mặc định nữa — upload 1 JSON vài KB rẻ hơn rất nhiều so
+        # với rủi ro mất công đã tốn để tạo ra nó). Nếu 1 lần sync thất bại,
+        # item đó được ghi vào _pending_syncs và sẽ được TỰ ĐỘNG thử lại ở lần
+        # save_micro() kế tiếp, và bắt buộc phải "trả hết nợ" khi
+        # flush_pending_syncs() được gọi ở cuối mỗi stage.
+        self._pending_syncs: dict[str, Path] = {}  # remote_relative -> local_path
 
         # Register signal handlers for graceful shutdown
         self._original_sigint = signal.getsignal(signal.SIGINT)
@@ -113,6 +127,7 @@ class CheckpointManager:
         """
         p = self._micro_path(stage, item_id)
         if p.exists():
+            self._retry_pending_syncs()
             self._sync_to_cloud(p, f"checkpoints/{stage}_{item_id}.json")
 
     def save(self, stage: str, payload: Any) -> None:
@@ -153,21 +168,27 @@ class CheckpointManager:
             json.dump(wrapper, f, ensure_ascii=False, indent=2)
         tmp.replace(p)
 
-        # Throttle sync micro-checkpoint lên cloud để tránh spam API:
-        # - Nếu auto_save_interval > 0 (project.auto_save_interval trong
-        #   config.toml): sync theo THỜI GIAN, mỗi khi đã trôi qua ít nhất
-        #   auto_save_interval giây kể từ lần sync micro gần nhất.
-        # - Ngược lại (mặc định 0): giữ hành vi cũ, sync mỗi 5 lần gọi
-        #   save_micro() (dùng bộ đếm riêng _micro_save_count vì _save_count
-        #   chỉ tăng trong save(), không phản ánh số lần save_micro() thực sự
-        #   được gọi).
         self._micro_save_count += 1
+
+        # Trước khi làm gì mới, luôn cố "trả nợ" các lần sync đã thất bại
+        # trước đó -- nếu không làm bước này, 1 lần lỗi mạng thoáng qua sẽ
+        # khiến item đó biến mất khỏi cloud VĨNH VIỄN (bug cũ).
+        self._retry_pending_syncs()
+
         if self.auto_save_interval > 0:
-            should_sync = (time.time() - self._last_save_time) >= self.auto_save_interval
-        else:
-            should_sync = self._micro_save_count % 5 == 0
-        if should_sync:
-            self._sync_to_cloud(p, f"checkpoints/{stage}_{item_id}.json")
+            # Chế độ throttle THEO THỜI GIAN (tuỳ chọn, đọc từ
+            # project.auto_save_interval trong config.toml): chỉ dùng khi
+            # người dùng chủ động muốn giảm tần suất round-trip mạng cho các
+            # item RẺ (vd rất nhiều item nhỏ trong thời gian ngắn). Ngay cả
+            # khi bỏ qua sync ở đây, item vẫn đã có trong _pending_syncs nếu
+            # có sự cố, và sẽ được flush_pending_syncs() dọn sạch cuối stage.
+            should_sync_now = (time.time() - self._last_save_time) >= self.auto_save_interval
+            if not should_sync_now:
+                self._pending_syncs[f"checkpoints/{stage}_{item_id}.json"] = p
+                return
+
+        ok = self._sync_to_cloud(p, f"checkpoints/{stage}_{item_id}.json")
+        if ok:
             self._last_save_time = time.time()
 
     def load(self, stage: str) -> Any:
@@ -219,16 +240,75 @@ class CheckpointManager:
         tmp.replace(p)
         print("[checkpoint] Emergency checkpoint saved.")
 
-    def _sync_to_cloud(self, local_path: Path, remote_relative: str) -> None:
-        """Sync a single file to cloud storage."""
+    def _sync_to_cloud(self, local_path: Path, remote_relative: str) -> bool:
+        """Sync a single file to cloud storage.
+
+        BUGFIX: trước đây hàm này nuốt luôn kết quả (kể cả thất bại) và
+        không bao giờ báo cho save_micro() biết để thử lại -> 1 lần lỗi mạng
+        là mất checkpoint đó trên cloud vĩnh viễn dù file cục bộ vẫn còn.
+        Giờ trả về True/False thật, và tự ghi nhận vào self._pending_syncs
+        khi thất bại để lần gọi sau (hoặc flush_pending_syncs() cuối stage)
+        có thể thử lại.
+        """
         if self.cloud is None or not self.auto_sync_cloud:
-            return
+            return True  # không cấu hình cloud -> không có gì để "nợ"
+        ok = False
         try:
             remote_key = f"projects/{self.project_id}/{remote_relative}"
-            self.cloud._upload_file(local_path, remote_key)
+            ok = bool(self.cloud._upload_file(local_path, remote_key))
         except Exception:
-            # Don't crash pipeline on cloud sync failure
-            pass
+            ok = False
+        if ok:
+            self._pending_syncs.pop(remote_relative, None)
+        else:
+            self._pending_syncs[remote_relative] = local_path
+        return ok
+
+    def _retry_pending_syncs(self) -> None:
+        """Thử lại MỌI lần sync trước đó đã thất bại.
+
+        Gọi ở đầu mỗi save_micro() (rẻ: dict rỗng thì no-op ngay) để các lỗi
+        mạng thoáng qua tự phục hồi càng sớm càng tốt, không phải đợi tới
+        cuối stage mới phát hiện ra là đang "nợ" cloud.
+        """
+        if not self._pending_syncs or self.cloud is None or not self.auto_sync_cloud:
+            return
+        for remote_relative, local_path in list(self._pending_syncs.items()):
+            if not local_path.exists():
+                # File cục bộ không còn (hiếm khi xảy ra) -> bỏ khỏi hàng đợi,
+                # không có gì để upload lại nữa.
+                self._pending_syncs.pop(remote_relative, None)
+                continue
+            self._sync_to_cloud(local_path, remote_relative)
+
+    def flush_pending_syncs(self, max_retries: int = 5, retry_wait_sec: float = 3.0) -> bool:
+        """Ép mọi checkpoint còn đang 'nợ' cloud phải lên cloud trước khi coi
+        1 stage là an toàn để kết thúc.
+
+        BẮT BUỘC gọi hàm này ở cuối mỗi stage có dùng save_micro() (vision,
+        tts, render, preprocess) — đây chính là lưới an toàn cuối cùng đảm
+        bảo "đồng bộ chính xác 100%": dù throttle/lỗi mạng có làm trễ vài
+        lần trong lúc chạy, cuối stage KHÔNG ĐƯỢC còn item nào sót lại chỉ
+        tồn tại cục bộ.
+
+        Trả về True nếu mọi thứ đã lên cloud sạch sẽ, False nếu vẫn còn sót
+        (vd mất mạng hẳn) — khi đó pipeline nên in cảnh báo rõ ràng cho
+        người dùng thay vì im lặng như trước.
+        """
+        if self.cloud is None or not self.auto_sync_cloud:
+            return True
+        for attempt in range(1, max_retries + 1):
+            self._retry_pending_syncs()
+            if not self._pending_syncs:
+                return True
+            if attempt < max_retries:
+                time.sleep(retry_wait_sec)
+        remaining = len(self._pending_syncs)
+        print(f"[checkpoint] CẢNH BÁO: {remaining} checkpoint vẫn CHƯA lên được cloud sau "
+              f"{max_retries} lần thử (có thể do mất mạng). Dữ liệu vẫn AN TOÀN trên đĩa cục bộ, "
+              f"nhưng sẽ mất nếu máy/Colab bị reset trước khi bạn chạy lại hoặc bấm "
+              f"'5. Đồng bộ project lên cloud' để thử lại.")
+        return False
 
     def sync_all_to_cloud(self, force: bool = False) -> dict[str, int]:
         """Sync all checkpoint files to cloud storage.

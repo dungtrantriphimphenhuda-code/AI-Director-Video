@@ -270,6 +270,11 @@ def run_render(cfg, storyboard: dict[str, Any], tts_result: dict[str, Any] | Non
                 "progress": f"{idx}/{total_clips}",
             })
 
+    if checkpoint_mgr is not None:
+        # Lưới an toàn cuối stage: đảm bảo mọi clip đã render trong lần
+        # chạy này thực sự lên cloud trước khi ghép final_preview.mp4.
+        checkpoint_mgr.flush_pending_syncs()
+
     final_path = deliverables_dir / "final_preview.mp4"
     print("[render] Ghép các clip thành final_preview.mp4...")
     total_duration = storyboard["timeline"][-1]["output"]["end"] if storyboard["timeline"] else None

@@ -77,9 +77,9 @@ async def _synthesize_all(
             })
 
     if checkpoint_mgr is not None and sentences:
-        # Đảm bảo checkpoint của câu cuối luôn lên cloud, không phụ thuộc
-        # đúng bội số của chu kỳ throttle.
-        checkpoint_mgr.force_sync_micro("tts", sentences[-1]["clip_id"])
+        # Lưới an toàn cuối stage: đảm bảo MỌI câu đã tổng hợp trong lần
+        # chạy này thực sự lên cloud (không chỉ câu cuối như trước).
+        checkpoint_mgr.flush_pending_syncs()
 
     if n_skipped:
         print(f"[tts] Bỏ qua {n_skipped}/{total} câu đã tổng hợp sẵn (resume từ checkpoint).")

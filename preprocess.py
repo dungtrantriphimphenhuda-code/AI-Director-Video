@@ -288,6 +288,9 @@ def run_preprocess(cfg, checkpoint_mgr=None) -> dict[str, Any]:
                 "scenes_chunk": chunk,
                 "keyframes_chunk": chunk_keyframes,
             })
+        # Lưới an toàn cuối stage: đảm bảo mọi keyframe checkpoint đã tạo
+        # trong lần chạy này thực sự lên cloud.
+        checkpoint_mgr.flush_pending_syncs()
 
     with open(pipeline_dir / "scenes.json", "w", encoding="utf-8") as f:
         json.dump(scenes, f, ensure_ascii=False, indent=2)
