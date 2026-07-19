@@ -57,6 +57,85 @@ def _format_size(n: float) -> str:
     return f"{size:.1f}GB"
 
 
+class _HardTimeout(Exception):
+    """Nội bộ: đánh dấu 1 lần gọi upload/download đã vượt quá giới hạn thời
+    gian cứng do watchdog áp đặt (xem _run_with_watchdog)."""
+    pass
+
+
+_WATCHDOG_ASSUMED_MIN_SPEED_BYTES_PER_SEC = 2 * 1024 * 1024  # 2MB/s
+_WATCHDOG_BASE_TIMEOUT_SECONDS = 180  # sàn tối thiểu, đủ cho overhead + file nhỏ
+
+
+def _hard_timeout_for(size_bytes: int) -> float:
+    """Tính giới hạn thời gian cứng (giây) cho 1 lần upload/download 1 file,
+    dựa trên kích thước — HOÀN TOÀN ĐỘC LẬP với connect_timeout/read_timeout
+    của botocore, và độc lập với self._io_slots/self.max_retries.
+
+    Lý do cần lớp phòng thủ NÀY, RIÊNG BIỆT với io_slots + retry hiện có: đã
+    ghi nhận trường hợp 1 phần (part) của multipart transfer bị lỗi kết nối
+    ở tầng THẤP HƠN CẢ socket timeout, khiến luồng điều phối nội bộ của
+    s3transfer (thư viện con của boto3, xử lý multipart) bị deadlock chờ mãi
+    mãi — KHÔNG ném exception, nên: (a) read_timeout không được kích hoạt,
+    (b) vòng lặp retry ở _upload_file()/_download_file() không bao giờ chạy
+    tới nhánh except để thử lại, và (c) self._io_slots.release() trong
+    finally không bao giờ được gọi, làm CẠN DẦN slot cho các file khác.
+    Vì đây là bug ở tầng thư viện bên thứ 3 (không tự sửa được), cách duy
+    nhất để CHẮC CHẮN không bao giờ treo nữa là ép 1 giới hạn thời gian từ
+    BÊN NGOÀI, không phụ thuộc vào việc boto3 có tự báo lỗi hay không."""
+    return _WATCHDOG_BASE_TIMEOUT_SECONDS + (
+        size_bytes / _WATCHDOG_ASSUMED_MIN_SPEED_BYTES_PER_SEC
+    )
+
+
+def _run_with_watchdog(fn, timeout_seconds: float, label: str) -> tuple[bool, Exception | None]:
+    """Chạy `fn()` (không tham số) trong 1 thread daemon riêng và ép giới hạn
+    thời gian cứng `timeout_seconds`. Trả về (thành_công, lỗi_nếu_có):
+      - (True, None)   : fn() chạy xong, không lỗi.
+      - (False, exc)   : fn() ném exception (lỗi thật từ boto3) — nhánh này
+        vẫn để nguyên vòng lặp retry + backoff hiện có xử lý như cũ.
+      - (False, _HardTimeout(...)) : fn() KHÔNG xong kịp trong thời hạn —
+        watchdog chủ động coi là thất bại và trả lại quyền điều khiển cho
+        luồng gọi NGAY (kể cả để chạy attempt kế tiếp hoặc release slot),
+        không chờ thread con nữa.
+
+    LƯU Ý QUAN TRỌNG: Python không có cách an toàn để kill 1 thread đang
+    chạy dở code (đặc biệt là code C bên trong boto3/s3transfer). Nếu đây
+    đúng là ca deadlock nội bộ, thread con sẽ tiếp tục tồn tại (rò rỉ) ở
+    background cho tới khi tiến trình kết thúc. Đây là đánh đổi CÓ CHỦ Ý:
+    chấp nhận rò rỉ 1 thread daemon đang bị block (không giữ tiến trình
+    sống vì là daemon, không tốn CPU vì đang chờ I/O) để đổi lấy việc luồng
+    chính — và slot trong self._io_slots — không bao giờ bị treo vô thời
+    hạn. boto3 client được thiết kế thread-safe nên 1 thread rò rỉ không
+    gây lỗi dữ liệu cho các lần gọi khác dùng chung self.client sau này."""
+    outcome: dict[str, Any] = {}
+
+    def _target():
+        try:
+            fn()
+            outcome["ok"] = True
+        except Exception as e:
+            outcome["ok"] = False
+            outcome["error"] = e
+
+    t = threading.Thread(target=_target, daemon=True, name=f"watchdog-{label}")
+    t.start()
+    t.join(timeout_seconds)
+
+    if t.is_alive():
+        print(
+            f"[cloud] CẢNH BÁO: '{label}' TREO quá {timeout_seconds:.0f}s "
+            f"(nghi bug deadlock nội bộ s3transfer, không ném exception) — "
+            f"chủ động huỷ và coi là THẤT BẠI để retry. Thread con sẽ tự rò "
+            f"rỉ ở background (không ảnh hưởng các lần gọi sau)."
+        )
+        return False, _HardTimeout(f"watchdog timeout sau {timeout_seconds:.0f}s: {label}")
+
+    if outcome.get("ok"):
+        return True, None
+    return False, outcome.get("error", RuntimeError(f"lỗi không rõ khi chạy '{label}'"))
+
+
 class _ByteProgress:
     """Callback cho boto3 download_file/upload_file dùng cho 1 file nặng:
     in tiến độ theo byte thật (MB đã tải/tổng MB) trên dòng log riêng, có
@@ -287,6 +366,8 @@ class CloudStorage:
             print(f"[cloud] (đã chờ {wait_elapsed:.1f}s để có slot rảnh trước khi upload "
                   f"'{remote_key}')")
 
+        timeout = _hard_timeout_for(max(size, 0))
+
         try:
             last_err: Exception | None = None
             for attempt in range(self.max_retries + 1):
@@ -294,25 +375,28 @@ class CloudStorage:
                 if is_heavy:
                     print(f"[cloud] Bắt đầu upload file nặng '{remote_key}' "
                           f"({_format_size(size)}, lần thử {attempt + 1}/{self.max_retries + 1})...")
-                try:
-                    self.client.upload_file(
+                ok, err = _run_with_watchdog(
+                    lambda: self.client.upload_file(
                         str(local_path),
                         self.bucket_name,
                         remote_key,
                         Config=self._transfer_config,
-                    )
+                    ),
+                    timeout,
+                    label=f"upload {remote_key}",
+                )
+                if ok:
                     if is_heavy:
                         dt = time.time() - t0
                         print(f"[cloud] Upload xong file nặng '{remote_key}' "
                               f"({_format_size(size)}) trong {dt:.1f}s.")
                     return True
-                except Exception as e:
-                    last_err = e
-                    dt = time.time() - t0
-                    print(f"[cloud] Upload lỗi cho '{remote_key}' ({_format_size(max(size, 0))}) "
-                          f"sau {dt:.1f}s (lần {attempt + 1}/{self.max_retries + 1}): {e}")
-                    if attempt < self.max_retries:
-                        time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
+                last_err = err
+                dt = time.time() - t0
+                print(f"[cloud] Upload lỗi cho '{remote_key}' ({_format_size(max(size, 0))}) "
+                      f"sau {dt:.1f}s (lần {attempt + 1}/{self.max_retries + 1}): {err}")
+                if attempt < self.max_retries:
+                    time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
             print(f"[cloud] Upload thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
             return False
         finally:
@@ -384,6 +468,14 @@ class CloudStorage:
             print(f"[cloud] (đã chờ {wait_elapsed:.1f}s để có slot rảnh trước khi tải "
                   f"'{remote_key}')")
 
+        # BUGFIX #3 (2026-07): giới hạn thời gian cứng, độc lập với boto3 —
+        # xem docstring _run_with_watchdog. Kích thước remote lấy qua
+        # head_object (rẻ, không giữ slot lâu) để tính timeout hợp lý; nếu
+        # lỗi (hiếm), dùng size=0 -> vẫn có timeout sàn tối thiểu, an toàn
+        # hơn là không giới hạn nào.
+        size_for_timeout = self._remote_size(remote_key) or 0
+        timeout = _hard_timeout_for(size_for_timeout)
+
         try:
             last_err: Exception | None = None
             for attempt in range(self.max_retries + 1):
@@ -391,25 +483,28 @@ class CloudStorage:
                 if is_heavy:
                     print(f"[cloud] Bắt đầu tải file nặng '{remote_key}' "
                           f"(lần thử {attempt + 1}/{self.max_retries + 1})...")
-                try:
-                    self.client.download_file(
+                ok, err = _run_with_watchdog(
+                    lambda: self.client.download_file(
                         self.bucket_name,
                         remote_key,
                         str(local_path),
                         Callback=callback,
                         Config=self._transfer_config,
-                    )
+                    ),
+                    timeout,
+                    label=f"download {remote_key}",
+                )
+                if ok:
                     if is_heavy:
                         dt = time.time() - t0
                         print(f"[cloud] Tải xong file nặng '{remote_key}' trong {dt:.1f}s.")
                     return True
-                except Exception as e:
-                    last_err = e
-                    dt = time.time() - t0
-                    print(f"[cloud] Tải lỗi cho '{remote_key}' sau {dt:.1f}s "
-                          f"(lần {attempt + 1}/{self.max_retries + 1}): {e}")
-                    if attempt < self.max_retries:
-                        time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
+                last_err = err
+                dt = time.time() - t0
+                print(f"[cloud] Tải lỗi cho '{remote_key}' sau {dt:.1f}s "
+                      f"(lần {attempt + 1}/{self.max_retries + 1}): {err}")
+                if attempt < self.max_retries:
+                    time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
             print(f"[cloud] Tải thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
             return False
         finally:
