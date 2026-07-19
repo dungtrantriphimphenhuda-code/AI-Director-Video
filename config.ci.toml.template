@@ -50,26 +50,24 @@ asr_compute_type = "int8"   # int8 nhanh hơn trên CPU so với float16
 asr_language = "vi"
 
 # ---- Vision ----
-# QUAN TRỌNG: máy ảo GitHub Actions không có GPU, nên vision_backend PHẢI là
-# "mistral" hoặc "cerebras" (gọi API, không cần tải model nặng về chạy local).
-# Để "local" (Qwen3-VL-4B-Instruct chạy tại chỗ) sẽ RẤT chậm hoặc treo job
-# vì không có GPU.
-vision_backend = "mistral"
-cerebras_vision_model = "gemma-4-31b"
-cerebras_vision_max_images = 2
-cerebras_vision_rpm = 5
-
-mistral_vision_model = "mistral-large-latest"
-mistral_vision_max_images = 8
-mistral_vision_rpm = 15
-
-vision_model_name = "Qwen/Qwen3-VL-4B-Instruct"
+# Theo yêu cầu: giữ vision chạy LOCAL trên CI (giống máy cá nhân), không
+# dùng API. "moondream" (Moondream2, ~1.9B) là lựa chọn hợp lý nhất cho
+# trường hợp này vì model được thiết kế tối ưu cho CPU/edge — nhẹ hơn nhiều
+# so với "local" (Qwen3-VL-4B-Instruct, vốn giả định có GPU). Vẫn sẽ chậm
+# hơn đáng kể so với chạy trên máy có GPU, và với video dài có rủi ro không
+# kịp trong 6 giờ/job — nếu gặp treo/timeout thường xuyên, đổi lại
+# vision_backend = "mistral" (cần thêm secret MISTRAL_API_KEY) sẽ nhanh và
+# ổn định hơn nhiều.
+vision_backend = "moondream"
 vision_device = "cpu"
 vision_dtype = "float32"
 vision_max_new_tokens = 512
 vision_attn_implementation = "sdpa"
 vision_batch_size = 1
-vision_frames_per_scene = 3
+# Giảm còn 1 (thay vì 3) so với mặc định để bớt tải CPU cho "moondream" trên
+# CI — đổi lại phân tích cảnh sẽ kém chi tiết hơn đôi chút, nhưng đỡ rủi ro
+# treo/timeout với video dài hơn.
+vision_frames_per_scene = 1
 
 # ---- Scene detection ----
 scene_threshold = 27.0
