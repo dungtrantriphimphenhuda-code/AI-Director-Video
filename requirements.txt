@@ -24,9 +24,12 @@ ffmpeg-python>=0.2.0
 # transformers v5.x đổi cách init model nội bộ (yêu cầu post_init() set
 # all_tied_weights_keys) -> code custom trust_remote_code của moondream2
 # (HfMoondream) chưa theo kịp, load model sẽ vỡ với lỗi "'HfMoondream'
-# object has no attribute 'all_tied_weights_keys'". Ép về nhánh 4.x cho
-# tới khi moondream2/transformers vá lỗi này.
-transformers>=4.57.0
+# object has no attribute 'all_tied_weights_keys'". CHẶN <5.0.0 (trước đây
+# chỉ có ">=4.57.0" không giới hạn trên nên pip vẫn âm thầm cài v5.x và vỡ
+# -> đây chính là nguyên nhân lỗi, không phải chỉ do thiếu code xử lý).
+# vision.py cũng có 1 monkeypatch phòng hờ cho trường hợp môi trường (vd.
+# Colab cache cũ) đã lỡ cài sẵn transformers>=5.0 từ trước khi chạy lại.
+transformers>=4.57.0,<5.0.0
 accelerate>=1.2.0
 torch>=2.4.0
 qwen-vl-utils>=0.0.14
