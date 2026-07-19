@@ -116,8 +116,6 @@ projects_dir = "./projects"
 # Tigris — dùng được với bất kỳ provider tương thích S3 nào (Tigris,
 # Filebase, AWS S3, Cloudflare R2, v.v.), chỉ cần điền đúng endpoint_url/
 # region_name/addressing_style tương ứng bên dưới.
-# LƯU Ý: cloud_storage.py giờ gọi rclone (không còn boto3) — cần cài rclone
-# trước (không phải gói pip): curl https://rclone.org/install.sh | sudo bash
 # Access key để xác thực
 access_key = "PASTE_YOUR_ACCESS_KEY_HERE"
 # Secret key để xác thực

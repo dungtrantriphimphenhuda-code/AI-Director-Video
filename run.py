@@ -24,8 +24,6 @@ import os
 import shutil
 import subprocess
 import sys
-import warnings
-warnings.filterwarnings("ignore", category=SyntaxWarning)
 import time
 from pathlib import Path
 
@@ -35,7 +33,7 @@ from config import load_config  # noqa: E402
 from checkpoint import CheckpointManager  # noqa: E402
 from cloud_storage import get_cloud_storage_from_config, CloudStorage  # noqa: E402
 from project_manager import ProjectManager  # noqa: E402
-from platform_utils import ensure_ffmpeg  # noqa: E402
+from platform_utils import ensure_ffmpeg, ensure_rclone  # noqa: E402
 from progress_utils import StepTracker, print_progress_bar  # noqa: E402
 import reference_video  # noqa: E402
 
@@ -61,6 +59,7 @@ def ensure_python_packages(cfg=None) -> None:
         "openai": "openai",
         "edge_tts": "edge-tts",
         "srt": "srt",
+        "boto3": "boto3",
     }
     missing = []
     print(f"[deps] Đang kiểm tra {len(checks)} package...")
@@ -80,18 +79,6 @@ def ensure_python_packages(cfg=None) -> None:
         print("[deps] Xong.")
     else:
         print("[deps] Tất cả package đã sẵn sàng.")
-
-    # rclone là 1 BINARY (dùng bởi cloud_storage.py), không phải gói pip
-    # nên không nằm trong `checks` ở trên và KHÔNG tự cài được qua pip
-    # install -- chỉ kiểm tra và nhắc người dùng cài tay nếu thiếu. Thiếu
-    # rclone KHÔNG chặn pipeline chạy, chỉ tắt tính năng cloud sync (xem
-    # get_cloud_storage_from_config trong cloud_storage.py).
-    if shutil.which("rclone") is None:
-        print(
-            "[deps] CẢNH BÁO: chưa cài rclone -> tính năng cloud sync sẽ bị tắt. "
-            "Cài: curl https://rclone.org/install.sh | sudo bash "
-            "(xem thêm https://rclone.org/downloads/)"
-        )
 
 
 def ask_task_config(cfg, project_reference_urls: list[str] | None = None) -> dict:
@@ -606,6 +593,30 @@ def main() -> None:
         print("[main] Đã nạp HF token từ config.toml.")
 
     # Khởi tạo cloud storage
+    # rclone (binary CLI, KHÔNG phải gói pip) cần cho cloud_storage.py kể từ
+    # khi module này chuyển từ boto3 sang rclone (xem docstring ensure_rclone
+    # trong platform_utils.py). Nếu thiếu và không tự cài được, KHÔNG để
+    # get_cloud_storage_from_config() âm thầm trả về cloud=None như trước
+    # (khiến mọi project chỉ có trên cloud biến mất khỏi menu mà không rõ lý
+    # do) — chỉ thử cài khi cloud thực sự được cấu hình (có access_key thật),
+    # để người không dùng cloud sync không bị bắt cài thêm 1 binary thừa.
+    _cloud_access_key = cfg.get("cloud.access_key", "")
+    _cloud_configured = (
+        cfg.get("cloud.enabled", True)
+        and bool(_cloud_access_key)
+        and not _cloud_access_key.startswith("PASTE_")
+    )
+    if _cloud_configured:
+        try:
+            ensure_rclone()
+        except Exception as e:
+            print(f"\n[deps] CẢNH BÁO: không tự cài được rclone ({e})\n"
+                  f"[deps] -> Cloud storage (Tigris) sẽ bị TẮT cho tới khi rclone "
+                  f"được cài thủ công. MỌI project CHỈ tồn tại trên cloud (không "
+                  f"có bản cục bộ) sẽ KHÔNG hiện trong menu quản lý project cho "
+                  f"tới khi rclone hoạt động trở lại — đây không phải mất dữ liệu, "
+                  f"project vẫn còn nguyên trên cloud.\n")
+
     cloud = get_cloud_storage_from_config(cfg)
 
     # Kiểm tra có chạy ở chế độ menu project không.

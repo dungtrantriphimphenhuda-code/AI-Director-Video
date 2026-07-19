@@ -95,8 +95,6 @@ projects_dir = "./projects"
 # BẮT BUỘC bật cloud + điền đúng secret: đây là nơi DUY NHẤT project được
 # lưu lại giữa các lần chạy, vì máy ảo GitHub Actions bị xoá sạch sau mỗi
 # lần chạy xong.
-# LƯU Ý: cloud_storage.py giờ gọi rclone (không còn boto3) — workflow
-# run-pipeline.yml đã có bước "Cài rclone" cài sẵn binary này trên runner.
 access_key = "${CLOUD_ACCESS_KEY}"
 secret_key = "${CLOUD_SECRET_KEY}"
 bucket_name = "${CLOUD_BUCKET_NAME}"

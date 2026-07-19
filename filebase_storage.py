@@ -52,84 +52,6 @@ def _format_size(n: float) -> str:
     return f"{size:.1f}GB"
 
 
-class _HardTimeout(Exception):
-    """Nội bộ: đánh dấu 1 lần gọi upload/download đã vượt quá giới hạn thời
-    gian cứng do watchdog áp đặt (xem _run_with_watchdog)."""
-    pass
-
-
-# Tốc độ mạng TỐI THIỂU giả định để tính giới hạn thời gian cứng cho 1 file
-# theo kích thước — cố tình đặt THẤP (rộng rãi) hơn nhiều so với tốc độ mạng
-# thực tế thông thường, để không huỷ oan 1 file lớn đang tải bình thường
-# trên mạng chậm.
-_WATCHDOG_ASSUMED_MIN_SPEED_BYTES_PER_SEC = 2 * 1024 * 1024  # 2MB/s
-_WATCHDOG_BASE_TIMEOUT_SECONDS = 180  # sàn tối thiểu, đủ cho overhead + file nhỏ
-
-
-def _hard_timeout_for(size_bytes: int) -> float:
-    """Tính giới hạn thời gian cứng (giây) cho 1 lần upload/download 1 file,
-    dựa trên kích thước — HOÀN TOÀN ĐỘC LẬP với connect_timeout/read_timeout
-    của botocore.
-
-    Lý do cần lớp phòng thủ này: đã ghi nhận trường hợp 1 phần (part) của
-    multipart transfer bị lỗi kết nối ở tầng THẤP HƠN CẢ socket timeout,
-    khiến luồng điều phối nội bộ của s3transfer (thư viện con của boto3) bị
-    deadlock chờ mãi mãi — không ném exception, nên read_timeout không bao
-    giờ được kích hoạt và job treo vô thời hạn. Vì đây là bug ở tầng thư
-    viện bên thứ 3 (không tự sửa được), cách duy nhất để CHẮC CHẮN không
-    bao giờ treo nữa là ép 1 giới hạn thời gian từ BÊN NGOÀI, không phụ
-    thuộc vào việc boto3 có tự báo lỗi hay không."""
-    return _WATCHDOG_BASE_TIMEOUT_SECONDS + (
-        size_bytes / _WATCHDOG_ASSUMED_MIN_SPEED_BYTES_PER_SEC
-    )
-
-
-def _run_with_watchdog(fn, timeout_seconds: float, label: str) -> tuple[bool, Exception | None]:
-    """Chạy `fn()` (không tham số) trong 1 thread daemon riêng và ép giới hạn
-    thời gian cứng `timeout_seconds`. Trả về (thành_công, lỗi_nếu_có):
-      - (True, None)   : fn() chạy xong, không lỗi.
-      - (False, exc)   : fn() ném exception (lỗi thật từ boto3).
-      - (False, _HardTimeout(...)) : fn() KHÔNG xong kịp trong thời hạn —
-        watchdog chủ động coi là thất bại và trả lại quyền điều khiển cho
-        luồng gọi NGAY, không chờ thread con nữa.
-
-    LƯU Ý QUAN TRỌNG: Python không có cách an toàn để kill 1 thread đang
-    chạy dở code (đặc biệt là code C bên trong boto3/s3transfer). Nếu đây
-    đúng là ca deadlock nội bộ, thread con sẽ tiếp tục tồn tại (rò rỉ) ở
-    background cho tới khi tiến trình kết thúc. Đây là đánh đổi CÓ CHỦ Ý:
-    chấp nhận rò rỉ 1 thread daemon đang bị block (không giữ tiến trình
-    sống vì là daemon, không tốn CPU vì đang chờ I/O) để đổi lấy việc luồng
-    chính không bao giờ bị treo vô thời hạn. boto3 client được thiết kế
-    thread-safe nên 1 thread rò rỉ không gây lỗi dữ liệu cho các lần gọi
-    khác dùng chung self.client sau này."""
-    outcome: dict[str, Any] = {}
-
-    def _target():
-        try:
-            fn()
-            outcome["ok"] = True
-        except Exception as e:
-            outcome["ok"] = False
-            outcome["error"] = e
-
-    t = threading.Thread(target=_target, daemon=True, name=f"watchdog-{label}")
-    t.start()
-    t.join(timeout_seconds)
-
-    if t.is_alive():
-        print(
-            f"[filebase] CẢNH BÁO: '{label}' TREO quá {timeout_seconds:.0f}s "
-            f"(nghi bug deadlock nội bộ s3transfer, không ném exception) — "
-            f"chủ động huỷ và coi là THẤT BẠI để retry. Thread con sẽ tự rò "
-            f"rỉ ở background (không ảnh hưởng các lần gọi sau)."
-        )
-        return False, _HardTimeout(f"watchdog timeout sau {timeout_seconds:.0f}s: {label}")
-
-    if outcome.get("ok"):
-        return True, None
-    return False, outcome.get("error", RuntimeError(f"lỗi không rõ khi chạy '{label}'"))
-
-
 class _ByteProgress:
     """Callback cho boto3 download_file/upload_file dùng cho 1 file nặng:
     in tiến độ theo byte thật (MB đã tải/tổng MB) trên dòng log riêng, có
@@ -196,23 +118,6 @@ class FilebaseStorage:
             config=Config(
                 signature_version="s3v4",
                 s3={"addressing_style": addressing_style},
-                # BUGFIX (giống cloud_storage.py): upload_project()/
-                # download_project() chạy song song với ThreadPoolExecutor
-                # (mặc định 16 luồng) nhưng botocore mặc định chỉ cho 10
-                # connection đồng thời -> luồng dư ra bị block vô thời hạn
-                # chờ pool, không phải network timeout nên không tự lỗi/retry
-                # được, khiến job treo hàng giờ ở gần 100%.
-                #
-                # BUGFIX #2 (2026-07): 32 vẫn KHÔNG đủ vì tts.py chạy tối đa
-                # tts.max_concurrency (mặc định 40, xem config.toml) luồng
-                # song song, mỗi luồng tự gọi checkpoint_mgr.save_micro() ->
-                # thẳng _upload_file() dùng CHUNG client này, NGOÀI phạm vi
-                # upload_project()/download_project(). Đặt 64 để có dư nhiều
-                # cho mọi nơi gọi cloud hiện tại và tương lai.
-                max_pool_connections=64,
-                connect_timeout=30,
-                read_timeout=120,
-                retries={"max_attempts": 3, "mode": "standard"},
             ),
         )
 
@@ -262,35 +167,18 @@ class FilebaseStorage:
                 print(f"[filebase] Không tự tạo được bucket '{self.bucket_name}': {e}")
             return False
 
-    def _upload_file(self, local_path: Path, remote_key: str, max_attempts: int = 2) -> bool:
-        """Upload 1 file lên Filebase, bọc trong watchdog thời gian cứng
-        (_run_with_watchdog) độc lập với connect_timeout/read_timeout của
-        boto3 — nếu 1 lần upload không xong trong thời hạn tính theo kích
-        thước file (_hard_timeout_for), chủ động coi là thất bại và thử lại,
-        thay vì có nguy cơ treo vô thời hạn nếu gặp bug deadlock nội bộ của
-        s3transfer (xem docstring _run_with_watchdog)."""
+    def _upload_file(self, local_path: Path, remote_key: str) -> bool:
+        """Upload 1 file lên Filebase."""
         try:
-            size = local_path.stat().st_size
-        except OSError:
-            size = 0
-        timeout = _hard_timeout_for(size)
-
-        last_err: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            ok, err = _run_with_watchdog(
-                lambda: self.client.upload_file(str(local_path), self.bucket_name, remote_key),
-                timeout,
-                label=f"upload {remote_key}",
+            self.client.upload_file(
+                str(local_path),
+                self.bucket_name,
+                remote_key,
             )
-            if ok:
-                return True
-            last_err = err
-            if attempt < max_attempts:
-                print(f"[filebase] Upload '{remote_key}' lỗi (lần {attempt}/{max_attempts}): "
-                      f"{last_err} — thử lại...")
-
-        print(f"[filebase] Upload thất bại cho {remote_key} sau {max_attempts} lần thử: {last_err}")
-        return False
+            return True
+        except Exception as e:
+            print(f"[filebase] Upload thất bại cho {remote_key}: {e}")
+            return False
 
     def upload_public(self, local_path: Path, remote_key: str) -> bool:
         """Upload 1 file với ACL public-read — CHỈ dùng cho status.json (để
@@ -330,36 +218,22 @@ class FilebaseStorage:
             print(f"[filebase] Không bật được CORS (dashboard web có thể không đọc được status.json): {e}")
             return False
 
-    def _download_file(self, remote_key: str, local_path: Path, callback=None, max_attempts: int = 2) -> bool:
-        """Tải 1 file từ Filebase về, bọc trong watchdog thời gian cứng
-        (cùng cơ chế với _upload_file, xem docstring _run_with_watchdog)."""
+    def _download_file(self, remote_key: str, local_path: Path, callback=None) -> bool:
+        """Tải 1 file từ Filebase về. `callback`, nếu có, được boto3 gọi lại
+        nhiều lần trong lúc tải với số byte MỚI nhận (không phải luỹ kế) —
+        dùng cho file nặng để in tiến độ theo byte thật (xem download_project)."""
         try:
             local_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            print(f"[filebase] Không tạo được thư mục cho {local_path}: {e}")
-            return False
-
-        size = self._remote_size(remote_key) or 0
-        timeout = _hard_timeout_for(size)
-
-        last_err: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            ok, err = _run_with_watchdog(
-                lambda: self.client.download_file(
-                    self.bucket_name, remote_key, str(local_path), Callback=callback,
-                ),
-                timeout,
-                label=f"download {remote_key}",
+            self.client.download_file(
+                self.bucket_name,
+                remote_key,
+                str(local_path),
+                Callback=callback,
             )
-            if ok:
-                return True
-            last_err = err
-            if attempt < max_attempts:
-                print(f"[filebase] Tải '{remote_key}' lỗi (lần {attempt}/{max_attempts}): "
-                      f"{last_err} — thử lại...")
-
-        print(f"[filebase] Tải thất bại cho {remote_key} sau {max_attempts} lần thử: {last_err}")
-        return False
+            return True
+        except Exception as e:
+            print(f"[filebase] Tải thất bại cho {remote_key}: {e}")
+            return False
 
     def _list_files(self, prefix: str) -> list[str]:
         """Liệt kê tất cả file dưới 1 prefix (thư mục) trên Filebase."""

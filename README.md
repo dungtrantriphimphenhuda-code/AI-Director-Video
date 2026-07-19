@@ -347,7 +347,6 @@ AI-Director-Video/
 - Or enter video path when prompted
 
 ### Cloud sync fails
-- Make sure `rclone` is installed and on your `PATH` (`rclone version`) — cloud sync now shells out to it instead of using boto3
 - Check `access_key` and `secret_key` in `[cloud]`
 - Ensure bucket name is correct and, for Tigris, that `region_name = "auto"` and `addressing_style = "virtual"`
 - Pipeline continues locally even if cloud sync fails
@@ -379,9 +378,6 @@ AI-Director-Video/
 1. Sign up at https://www.tigrisdata.com and create an access key + bucket
 2. Fill in `[cloud]` in `config.toml` with the access key, secret key, and bucket name
 3. Set `cloud.enabled = true` to use cloud sync (endpoint/region/addressing_style already default to Tigris)
-4. Install `rclone` (CLI binary, not a pip package) — cloud sync (`cloud_storage.py`) now runs on top of it instead of boto3, since rclone's retry/timeout/multipart handling is far more battle-tested than a hand-rolled one:
-   - Linux/macOS: `curl https://rclone.org/install.sh | sudo bash`
-   - Other platforms: https://rclone.org/downloads/
 
 ---
 
