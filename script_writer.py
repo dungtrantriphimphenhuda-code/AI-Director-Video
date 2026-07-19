@@ -133,11 +133,16 @@ def generate_hooks(cfg, task_config: dict[str, Any], director_brief: str = "") -
     Sinh 10 câu hook mở đầu theo 4 hướng (phản差+爽点, 荒诞, 悬念, 提问, 数据)
     như mô tả trong skill.md Step 3. Trả về list [{"style": ..., "text": ...}].
     """
+    narration_language = task_config.get("narration_language", "Vietnamese")
     system_prompt = (
         "You are a viral short-video scriptwriter for movie/drama commentary channels. "
-        "Write hooks in the same language as the plot summary provided. "
+        f"Write ALL hooks in {narration_language}, regardless of what language the plot "
+        f"summary/brief below is written in (translate/adapt as needed) — the narration "
+        f"voice-over for this project is {narration_language}, so text in any other "
+        f"language cannot be used as-is. "
         "Respond ONLY with a JSON array of 10 objects: "
-        '[{"style": "contrast|absurd|suspense|question|data", "text": "..."}]. '
+        '[{"style": "contrast|absurd|suspense|question|data", "text": "...", '
+        '"language_used": "..."}]. '
         "No extra text."
     )
     user_prompt = (
@@ -186,11 +191,17 @@ def generate_narration(
         for b in semantic_blocks
     ]
 
+    narration_language = task_config.get("narration_language", "Vietnamese")
     system_prompt = (
         "You are the story director for a viral movie/drama commentary video. "
         "You receive a list of semantic scene blocks (each with a scene_id, time range, "
         "visual summary, dialogue snippets, characters, emotion, tags) extracted from the "
         "source video. Analyze plot roles, emotional arcs, reversals, and conflict. "
+        f"Write EVERY narration sentence in {narration_language} — this is the language of "
+        f"the TTS voice-over for this project, so text in any other language would be read "
+        f"aloud incorrectly. This applies even if the scene blocks, dialogue snippets, hook, "
+        f"or director's brief given to you below are in a different language: translate/adapt "
+        f"the narrative into {narration_language}, do not mix languages within a sentence. "
         "Write narration sentences that follow a viral formula appropriate to the genre, "
         "matching the target duration and point of view given. "
         "CRITICAL RULES:\n"

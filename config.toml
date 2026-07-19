@@ -96,6 +96,14 @@ min_scene_len_sec = 1.0
 narration_pov = "third_person"    # third_person | first_person
 content_type = "movie"            # movie | tv_drama | anime | short_drama | foreign_language_commentary
 genre = "drama"
+# Ngôn ngữ VIẾT KỊCH BẢN/NARRATION (hook + toàn bộ câu thoại dẫn chuyện),
+# dùng tên ngôn ngữ đầy đủ (LLM hiểu rõ hơn mã ISO) — PHẢI khớp với giọng
+# đọc TTS ở mục [tts] voice bên trên, nếu không giọng Việt sẽ đọc văn bản
+# tiếng Anh (hoặc ngược lại), nghe rất lạc quẻ. Trước đây key này không tồn
+# tại -> script_writer.py chỉ "đoán" ngôn ngữ theo plot_summary do người
+# dùng nhập, nếu bỏ trống (Enter) sẽ mặc định về tiếng Anh dù voice đã để
+# tiếng Việt.
+narration_language = "Vietnamese"
 target_duration_sec = 180
 chars_per_sec = 4.0                # CJK characters per second
 words_per_sec = 2.5                 # Vietnamese/English words per second

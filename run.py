@@ -126,6 +126,7 @@ def ask_task_config(cfg, project_reference_urls: list[str] | None = None) -> dic
         "narration_pov": cfg.get("processing.narration_pov", "third_person"),
         "content_type": cfg.get("processing.content_type", "movie"),
         "genre": cfg.get("processing.genre", "drama"),
+        "narration_language": cfg.get("processing.narration_language", "Vietnamese"),
         "target_duration_sec": cfg.get("processing.target_duration_sec", 180),
     }
 
