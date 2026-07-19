@@ -139,12 +139,22 @@ class CloudStorage:
                 # exception nào được ném ra để retry logic trong _upload_file
                 # bắt được. Kết quả: job treo hàng giờ ở gần 100% (vd 6438/6441)
                 # cho tới khi bị hủy ngoài ý muốn (GitHub Actions timeout-minutes).
-                # Đặt max_pool_connections dư dả (>= max_workers lớn nhất có thể
-                # dùng) để loại bỏ tình trạng nghẽn cổ chai này. Đồng thời set rõ
-                # connect_timeout/read_timeout để các request thực sự bị treo do
-                # mạng (không phải do nghẽn pool) sẽ tự lỗi và được retry thay vì
-                # treo vô thời hạn.
-                max_pool_connections=32,
+                # Đặt max_pool_connections dư dả (>= mức concurrency lớn nhất có
+                # thể dùng TRONG TOÀN BỘ codebase, không chỉ riêng
+                # upload_project/download_project) để loại bỏ tình trạng nghẽn cổ
+                # chai này. Đồng thời set rõ connect_timeout/read_timeout để các
+                # request thực sự bị treo do mạng (không phải do nghẽn pool) sẽ tự
+                # lỗi và được retry thay vì treo vô thời hạn.
+                #
+                # BUGFIX #2 (2026-07): 32 vẫn KHÔNG đủ — tts.py chạy tối đa
+                # tts.max_concurrency (mặc định 40, xem config.toml) luồng song
+                # song, mỗi luồng tự gọi checkpoint_mgr.save_micro() -> thẳng
+                # _upload_file() dùng CHUNG client này, NGOÀI phạm vi
+                # upload_project()/download_project(). 40 > 32 khiến 8 luồng dư
+                # bị treo vô thời hạn y hệt bug đã mô tả ở trên, đúng vào lúc
+                # chạy TTS (thường ngay sau khi vừa tải project xong). Đặt 64 để
+                # có dư nhiều cho mọi nơi gọi cloud hiện tại và tương lai.
+                max_pool_connections=64,
                 connect_timeout=30,
                 read_timeout=120,
                 retries={"max_attempts": 3, "mode": "standard"},

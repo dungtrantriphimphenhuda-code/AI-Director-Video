@@ -124,7 +124,14 @@ class FilebaseStorage:
                 # connection đồng thời -> luồng dư ra bị block vô thời hạn
                 # chờ pool, không phải network timeout nên không tự lỗi/retry
                 # được, khiến job treo hàng giờ ở gần 100%.
-                max_pool_connections=32,
+                #
+                # BUGFIX #2 (2026-07): 32 vẫn KHÔNG đủ vì tts.py chạy tối đa
+                # tts.max_concurrency (mặc định 40, xem config.toml) luồng
+                # song song, mỗi luồng tự gọi checkpoint_mgr.save_micro() ->
+                # thẳng _upload_file() dùng CHUNG client này, NGOÀI phạm vi
+                # upload_project()/download_project(). Đặt 64 để có dư nhiều
+                # cho mọi nơi gọi cloud hiện tại và tương lai.
+                max_pool_connections=64,
                 connect_timeout=30,
                 read_timeout=120,
                 retries={"max_attempts": 3, "mode": "standard"},
