@@ -489,58 +489,87 @@ class MistralVisionAnalyzer:
 # câu hỏi — nên implement analyze_scene() đơn lẻ (không có analyze_batch),
 # và chỉ đọc 1 keyframe đại diện/scene (frame ở giữa danh sách keyframes).
 
-def _patch_moondream_class() -> None:
+def _patch_moondream_class(model_name: str, cache_dir: str | None = None, revision: str | None = None) -> None:
     """
     Monkey-patch HfMoondream (loaded via trust_remote_code) để tương thích
     transformers 5.x. transformers 5 yêu cầu:
       1. `all_tied_weights_keys` property trong _finalize_model_loading
-      2. `post_init()` được gọi để khởi tạo các trường nội bộ mới
+      2. `_tied_weights_keys` phải tồn tại sau __init__
     Code remote của moondream2 (rev 2025-06-21) chưa có cả hai.
+
+    Cách tiếp cận: dùng get_class_from_dynamic_module (API chính thức của
+    transformers) để lấy class TRƯỚC khi from_pretrained tạo instance,
+    rồi patch trực tiếp trên class. Đây là cách chắc chắn nhất vì class
+    được patch trước khi bất kỳ instance nào được tạo.
     """
     import sys
-    import inspect
+    import importlib
 
-    for mod_name, mod in list(sys.modules.items()):
-        if "transformers_modules" in mod_name and hasattr(mod, "HfMoondream"):
-            cls = mod.HfMoondream
+    cls = None
+    cfg_kwargs = {"trust_remote_code": True}
+    if cache_dir:
+        cfg_kwargs["cache_dir"] = cache_dir
+    if revision:
+        cfg_kwargs["revision"] = revision
 
-            # --- Patch 1: all_tied_weights_keys property ---
-            if not hasattr(cls, "all_tied_weights_keys"):
-                @property
-                def all_tied_weights_keys(self):
-                    return getattr(self, "_tied_weights_keys", {})
-                cls.all_tied_weights_keys = all_tied_weights_keys
+    # --- Cách 1: Dùng get_class_from_dynamic_module (API chính thức HF) ---
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        from transformers import AutoConfig
 
-            # --- Patch 2: post_init() for transformers 5 compatibility ---
-            # transformers 5 gọi post_init() trong _finalize_model_loading
-            # để khởi tạo các trường nội bộ. Nếu class không có post_init,
-            # nó sẽ dùng post_init của PreTrainedModel (base class).
-            # Tuy nhiên, nếu HfMoondream override __init__ mà không gọi
-            # super().__init__() đúng cách, post_init có thể không được gọi.
-            # Đảm bảo post_init tồn tại và gọi được.
-            if not hasattr(cls, "post_init") or not callable(getattr(cls, "post_init", None)):
-                def post_init(self):
-                    # Gọi post_init của parent class nếu có
-                    for base in cls.__mro__[1:]:
-                        if hasattr(base, "post_init") and callable(base.post_init):
-                            try:
-                                base.post_init(self)
-                            except Exception:
-                                pass
-                            break
-                cls.post_init = post_init
+        config = AutoConfig.from_pretrained(model_name, **cfg_kwargs)
+        class_ref = None
+        if hasattr(config, "auto_map") and config.auto_map:
+            class_ref = config.auto_map.get("AutoModelForCausalLM")
 
-            # --- Patch 3: Đảm bảo _tied_weights_keys tồn tại ---
-            original_init = cls.__init__
+        if class_ref:
+            cls = get_class_from_dynamic_module(class_ref, model_name, **cfg_kwargs)
+    except Exception:
+        pass
 
-            def patched_init(self, *args, **kwargs):
-                original_init(self, *args, **kwargs)
-                # Đảm bảo _tied_weights_keys tồn tại sau init
-                if not hasattr(self, "_tied_weights_keys"):
-                    self._tied_weights_keys = {}
+    # --- Cách 2: Tìm trong sys.modules (đã load từ lần chạy trước) ---
+    if cls is None:
+        for mod_name, mod in list(sys.modules.items()):
+            if hasattr(mod, "HfMoondream"):
+                cls = mod.HfMoondream
+                break
 
-            cls.__init__ = patched_init
-            break
+    # --- Cách 3: Thử import trực tiếp từ transformers_modules ---
+    if cls is None:
+        parts = model_name.replace("/", ".").split(".")
+        for suffix in ["hf_moondream", "moondream"]:
+            try:
+                mod_path = f"transformers_modules.{'.'.join(parts)}.{suffix}"
+                mod = importlib.import_module(mod_path)
+                if hasattr(mod, "HfMoondream"):
+                    cls = mod.HfMoondream
+                    break
+            except Exception:
+                pass
+
+    if cls is None:
+        print("[vision] Warning: Không tìm thấy class HfMoondream để patch. "
+              "Nếu transformers>=5.0, load model có thể crash với lỗi all_tied_weights_keys.")
+        return
+
+    # --- Patch 1: all_tied_weights_keys property ---
+    if not hasattr(cls, "all_tied_weights_keys"):
+        @property
+        def all_tied_weights_keys(self):
+            return getattr(self, "_tied_weights_keys", {})
+        cls.all_tied_weights_keys = all_tied_weights_keys
+
+    # --- Patch 2: Đảm bảo _tied_weights_keys tồn tại sau __init__ ---
+    original_init = cls.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not hasattr(self, "_tied_weights_keys"):
+            self._tied_weights_keys = {}
+
+    cls.__init__ = patched_init
+    print(f"[vision] Patched {cls.__name__} for transformers 5.x compatibility.")
+
 
 
 class MoondreamVisionAnalyzer:
@@ -582,7 +611,7 @@ class MoondreamVisionAnalyzer:
         except Exception as e:
             print(f"[vision] Warning: Could not preload config for patching: {e}")
 
-        _patch_moondream_class()
+        _patch_moondream_class(self.model_name, self.cache_dir, self.revision)
 
         # --- Tự động chọn dtype & device_map theo phần cứng ---
         if self.device == "cuda":
