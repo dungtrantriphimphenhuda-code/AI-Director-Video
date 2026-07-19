@@ -129,6 +129,25 @@ class CloudStorage:
             config=Config(
                 signature_version="s3v4",
                 s3={"addressing_style": addressing_style},
+                # BUGFIX: upload_project()/download_project() chạy song song
+                # với ThreadPoolExecutor(max_workers=...) (mặc định 16), nhưng
+                # botocore mặc định chỉ cho phép 10 connection đồng thời
+                # (max_pool_connections=10). Khi số luồng > số connection
+                # trong pool, các luồng dư ra bị BLOCK VÔ THỜI HẠN chờ pool
+                # trả connection — đây KHÔNG phải network timeout nên
+                # connect_timeout/read_timeout không áp dụng, và không có
+                # exception nào được ném ra để retry logic trong _upload_file
+                # bắt được. Kết quả: job treo hàng giờ ở gần 100% (vd 6438/6441)
+                # cho tới khi bị hủy ngoài ý muốn (GitHub Actions timeout-minutes).
+                # Đặt max_pool_connections dư dả (>= max_workers lớn nhất có thể
+                # dùng) để loại bỏ tình trạng nghẽn cổ chai này. Đồng thời set rõ
+                # connect_timeout/read_timeout để các request thực sự bị treo do
+                # mạng (không phải do nghẽn pool) sẽ tự lỗi và được retry thay vì
+                # treo vô thời hạn.
+                max_pool_connections=32,
+                connect_timeout=30,
+                read_timeout=120,
+                retries={"max_attempts": 3, "mode": "standard"},
             ),
         )
 

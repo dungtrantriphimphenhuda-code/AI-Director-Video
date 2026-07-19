@@ -13,11 +13,16 @@ faster-whisper>=1.2.1
 
 # --- Scene detection / video processing ---
 scenedetect[opencv]>=0.7
-opencv-python =4.13.0
+opencv-python==4.13.0
 ffmpeg-python>=0.2.0
 
 # --- Vision (Qwen3-VL-4B-Instruct, backend "local") ---
-transformers>=4.57.0
+# transformers v5.x đổi cách init model nội bộ (yêu cầu post_init() set
+# all_tied_weights_keys) -> code custom trust_remote_code của moondream2
+# (HfMoondream) chưa theo kịp, load model sẽ vỡ với lỗi "'HfMoondream'
+# object has no attribute 'all_tied_weights_keys'". Ép về nhánh 4.x cho
+# tới khi moondream2/transformers vá lỗi này.
+transformers>=4.57.0,<5.0.0
 accelerate>=1.2.0
 torch>=2.4.0
 qwen-vl-utils>=0.0.14

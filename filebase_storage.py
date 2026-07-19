@@ -118,6 +118,16 @@ class FilebaseStorage:
             config=Config(
                 signature_version="s3v4",
                 s3={"addressing_style": addressing_style},
+                # BUGFIX (giống cloud_storage.py): upload_project()/
+                # download_project() chạy song song với ThreadPoolExecutor
+                # (mặc định 16 luồng) nhưng botocore mặc định chỉ cho 10
+                # connection đồng thời -> luồng dư ra bị block vô thời hạn
+                # chờ pool, không phải network timeout nên không tự lỗi/retry
+                # được, khiến job treo hàng giờ ở gần 100%.
+                max_pool_connections=32,
+                connect_timeout=30,
+                read_timeout=120,
+                retries={"max_attempts": 3, "mode": "standard"},
             ),
         )
 
