@@ -42,8 +42,8 @@ asr_language = "vi"               # language code, leave empty "" for auto-detec
 
 # ---- Vision ----
 # "local" (needs GPU) | "cerebras" | "mistral" | "qwen2vl" (nhẹ, ~2B,
-# không cần trust_remote_code, chạy ổn CPU/CUDA/MPS) | "moondream" (KHÔNG
-# khuyến nghị với transformers>=5.0 do lỗi trust_remote_code)
+# không cần trust_remote_code, chạy ổn CPU/CUDA/MPS). "moondream" ĐÃ BỎ.
+# Nếu config cũ vẫn để "moondream", pipeline tự động fallback sang "qwen2vl".
 vision_backend = "qwen2vl"
 cerebras_vision_model = "gemma-4-31b"
 cerebras_vision_max_images = 2
