@@ -477,6 +477,137 @@ class MistralVisionAnalyzer:
 
 
 # =============================================================================
+# =============================================================================
+# Backend "qwen2vl" — Qwen2-VL-2B-Instruct (~2B), nhẹ + ổn định + mọi phần cứng
+# =============================================================================
+#
+# Thay thế moondream (bị lỗi trust_remote_code với transformers>=5.0).
+# Qwen2-VL-2B chỉ ~2B tham số (nhẹ hơn Qwen3-VL-4B 2x, ngang moondream2),
+# chạy ổn định trên transformers chính thức (không cần trust_remote_code),
+# hỗ trợ multi-image batch như Qwen3-VL, và chạy được trên CPU/CUDA/MPS.
+# Đây là lựa chọn mặc định cho máy không GPU hoặc GPU yếu.
+
+class Qwen2VLVisionAnalyzer:
+    """Bọc Qwen2-VL-2B-Instruct, load một lần và tái sử dụng."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.model_name = cfg.get("processing.qwen2vl_model_name", "Qwen/Qwen2-VL-2B-Instruct")
+        self.cache_dir = str(cfg.resolve_path("paths.model_cache_dir"))
+        self.device = resolve_torch_device(cfg.get("processing.vision_device", "auto"))
+        self.max_new_tokens = cfg.get("processing.vision_max_new_tokens", 512)
+        self.batch_size = max(1, cfg.get("processing.vision_batch_size", 4))
+        self.model = None
+        self.processor = None
+        self._torch = None
+
+    def load(self) -> None:
+        import torch
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+        self._torch = torch
+
+        print(f"[vision] Loading {self.model_name} on {self.device} "
+              f"(backend=qwen2vl, batch_size={self.batch_size})... "
+              f"(~2B params, nhẹ hơn Qwen3-VL-4B, không cần trust_remote_code)")
+
+        kwargs = {"cache_dir": self.cache_dir}
+
+        if self.device == "cuda":
+            if torch.cuda.is_bf16_supported():
+                kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                kwargs["torch_dtype"] = torch.float16
+            kwargs["device_map"] = "auto"
+        elif self.device == "mps":
+            kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            kwargs["torch_dtype"] = torch.float32
+
+        self.processor = AutoProcessor.from_pretrained(self.model_name, **kwargs)
+        self.model = AutoModelForVision2Seq.from_pretrained(self.model_name, **kwargs)
+
+        if "device_map" not in kwargs:
+            self.model.to(self.device)
+        self.model.eval()
+
+    def unload(self) -> None:
+        del self.model
+        del self.processor
+        self.model = None
+        self.processor = None
+        gc.collect()
+        if self._torch is not None:
+            try:
+                self._torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def _build_messages(self, frame_paths: list[str]) -> list[dict]:
+        return [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image", "image": p} for p in frame_paths
+            ] + [{
+                "type": "text",
+                "text": "Analyze this scene and return the JSON object described in the system prompt.",
+            }]},
+        ]
+
+    def analyze_batch(self, scenes: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
+        if self.model is None:
+            raise RuntimeError("Qwen2VLVisionAnalyzer chưa được load(). Gọi .load() trước.")
+
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError:
+            process_vision_info = None
+
+        results: list[dict[str, Any]] = []
+        for scene_id, frame_paths in scenes:
+            existing = [p for p in frame_paths if Path(p).exists()]
+            if not existing:
+                results.append(_empty_result(scene_id, reason="no_frames"))
+                continue
+
+            messages = self._build_messages(existing)
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            if process_vision_info is not None:
+                image_inputs, _ = process_vision_info(messages)
+            else:
+                image_inputs = [{"type": "image", "image": p} for p in existing]
+
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                return_tensors="pt",
+                padding=True,
+            )
+            inputs = inputs.to(self.model.device)
+
+            with self._torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs, max_new_tokens=self.max_new_tokens,
+                )
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True,
+            )[0]
+
+            parsed = _parse_json_response(output_text)
+            parsed["scene_id"] = scene_id
+            results.append(parsed)
+
+        return results
+
+    def analyze_scene(self, scene_id: str, frame_paths: list[str]) -> dict[str, Any]:
+        results = self.analyze_batch([(scene_id, frame_paths)])
+        return results[0]
+
+
 # Backend "moondream" — Moondream2 (~1.9B), tối ưu cho CPU/edge
 # =============================================================================
 #
@@ -707,6 +838,8 @@ def _build_analyzer(cfg):
         return CerebrasVisionAnalyzer(cfg)
     if backend == "mistral":
         return MistralVisionAnalyzer(cfg)
+    if backend == "qwen2vl":
+        return Qwen2VLVisionAnalyzer(cfg)
     if backend == "moondream":
         return MoondreamVisionAnalyzer(cfg)
     return LocalVisionAnalyzer(cfg)
