@@ -132,6 +132,8 @@ projects_dir = "./projects"
 # cloud_storage.py) hoàn toàn generic cho mọi provider tương thích S3 —
 # chỉ cần đổi giá trị bên dưới là dùng được provider khác (Filebase, AWS S3,
 # Cloudflare R2, ...), không cần sửa code.
+# LƯU Ý: cloud_storage.py giờ gọi rclone (không còn boto3) — cần cài rclone
+# trước (không phải gói pip): curl https://rclone.org/install.sh | sudo bash
 # Access key (Tigris)
 access_key = "tid_dNkBsQSwjrwPNURmxVXaAVHbTti_atxKRhbAFLgzidMEUBhiNs"
 # Secret key (Tigris)

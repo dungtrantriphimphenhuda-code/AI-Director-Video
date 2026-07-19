@@ -59,7 +59,6 @@ def ensure_python_packages(cfg=None) -> None:
         "openai": "openai",
         "edge_tts": "edge-tts",
         "srt": "srt",
-        "boto3": "boto3",
     }
     missing = []
     print(f"[deps] Đang kiểm tra {len(checks)} package...")
@@ -79,6 +78,18 @@ def ensure_python_packages(cfg=None) -> None:
         print("[deps] Xong.")
     else:
         print("[deps] Tất cả package đã sẵn sàng.")
+
+    # rclone là 1 BINARY (dùng bởi cloud_storage.py), không phải gói pip
+    # nên không nằm trong `checks` ở trên và KHÔNG tự cài được qua pip
+    # install -- chỉ kiểm tra và nhắc người dùng cài tay nếu thiếu. Thiếu
+    # rclone KHÔNG chặn pipeline chạy, chỉ tắt tính năng cloud sync (xem
+    # get_cloud_storage_from_config trong cloud_storage.py).
+    if shutil.which("rclone") is None:
+        print(
+            "[deps] CẢNH BÁO: chưa cài rclone -> tính năng cloud sync sẽ bị tắt. "
+            "Cài: curl https://rclone.org/install.sh | sudo bash "
+            "(xem thêm https://rclone.org/downloads/)"
+        )
 
 
 def ask_task_config(cfg, project_reference_urls: list[str] | None = None) -> dict:

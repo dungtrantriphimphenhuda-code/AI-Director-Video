@@ -1,12 +1,28 @@
 """
-cloud_storage.py — Tích hợp lưu trữ cloud tương thích S3 (hiện dùng Tigris).
+cloud_storage.py — Tích hợp lưu trữ cloud tương thích S3 (hiện dùng Tigris),
+qua rclone.
 
-Dùng boto3 để giao tiếp với một dịch vụ object storage tương thích S3
-(mặc định: Tigris — https://www.tigrisdata.com) nhằm sao lưu/khôi phục dữ
-liệu project lên/từ cloud. Logic hoàn toàn generic nên cũng dùng được với
-Filebase, AWS S3, Cloudflare R2, hay bất kỳ provider tương thích S3 nào
-khác — chỉ cần đổi endpoint_url/region_name/addressing_style trong
-config.toml (mục [cloud]).
+TẠI SAO ĐỔI TỪ boto3 SANG rclone (2026-07):
+Bản boto3 cũ (~900 dòng) phải tự tay xử lý mọi thứ: retry, backoff,
+multipart, giới hạn số connection song song, và một bug deadlock nội bộ
+của s3transfer khiến job "treo hàng giờ" mà không ném exception nào cả —
+phải chống bằng 1 lớp watchdog thread tự chế khá phức tạp và vẫn rò rỉ
+thread khi gặp ca xấu nhất. rclone là 1 binary CLI được cả cộng đồng dùng
+nhiều năm để sync dữ liệu lớn lên S3-compatible storage: retry, backoff,
+multipart, giới hạn số connection song song, và timeout theo "không còn
+tiến triển" (idle timeout, tự reset mỗi khi có byte mới, không giết oan
+job đang tải file nhiều GB) đều đã được xử lý bên trong rclone, rất
+trưởng thành và ổn định. Module này giờ chỉ còn là 1 lớp mỏng gọi rclone
+qua subprocess — ít code tự viết hơn nhiều => ít "lỗi vặt" hơn.
+
+Logic hoàn toàn generic nên vẫn dùng được với Filebase, AWS S3,
+Cloudflare R2, hay bất kỳ provider tương thích S3 nào khác — chỉ cần đổi
+endpoint_url/region_name/addressing_style trong config.toml (mục [cloud]),
+giống hệt như trước.
+
+YÊU CẦU: cần cài rclone (không phải gói pip) — https://rclone.org/downloads/
+  Linux/macOS: curl https://rclone.org/install.sh | sudo bash
+  Windows: xem hướng dẫn tại https://rclone.org/downloads/
 
 Tigris endpoint: https://t3.storage.dev
 Giao thức: tương thích S3 API
@@ -14,156 +30,80 @@ Giao thức: tương thích S3 API
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import threading
+import re
+import shutil
+import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-try:
-    import boto3
-    from botocore.config import Config
-    from boto3.s3.transfer import TransferConfig
-    HAS_BOTO3 = True
-except ImportError:
-    HAS_BOTO3 = False
+RCLONE_BIN = shutil.which("rclone")
+HAS_RCLONE = RCLONE_BIN is not None
 
-try:
-    from progress_utils import print_progress_bar
-except ImportError:
-    def print_progress_bar(current, total, prefix="", suffix="", bar_len=30):
-        pass  # fallback im lặng nếu progress_utils không có sẵn (không nên xảy ra trong project này)
+# Tên remote rclone dùng nội bộ — KHÔNG ghi ra file rclone.conf nào trên
+# đĩa, toàn bộ cấu hình (access_key, secret_key, endpoint...) được truyền
+# qua biến môi trường RCLONE_CONFIG_<TÊN>_<KEY> cho từng tiến trình con,
+# nên không đụng tới (và không bị đụng bởi) rclone.conf thật của người
+# dùng nếu họ có sẵn 1 cái, cũng như trước đây secret chỉ nằm trong
+# config.toml chứ không ghi thêm ra chỗ khác.
+_REMOTE_NAME = "aidirectorcloud"
 
-
-# File có kích thước >= ngưỡng này (video gốc, checkpoint model...) được coi
-# là "nặng": tải RIÊNG (không xen vào ThreadPoolExecutor của các file nhỏ)
-# và có dòng tiến độ RIÊNG tính theo byte thật, thay vì lẫn vào thanh đếm
-# số file — trước đây 1 file 1.3GB cũng chỉ tính là "+1" như 1 file keyframe
-# vài chục KB, nên thanh đếm file gần như đứng im ở vòng lặp cuối dù vẫn
-# đang tải, nhìn như bị treo.
-HEAVY_FILE_THRESHOLD_BYTES = 20 * 1024 * 1024  # 20MB
-
-
-def _format_size(n: float) -> str:
-    """Định dạng số byte thành chuỗi dễ đọc (KB/MB/GB)."""
-    size = float(n)
-    for unit in ("B", "KB", "MB"):
-        if size < 1024:
-            return f"{size:.1f}{unit}"
-        size /= 1024
-    return f"{size:.1f}GB"
+# Ngưỡng thời gian chờ (giây) áp cho MỖI lần gọi rclone cho 1 file ĐƠN LẺ
+# (dùng bởi _upload_file, gọi rất nhiều lần bởi checkpoint.py, có lúc tới
+# hàng chục lần song song từ tts.py). Đây CHỈ là lưới an toàn ở tầng
+# Python, phòng trường hợp hiếm bản thân tiến trình rclone bị treo hẳn —
+# khác với watchdog cũ, subprocess.run(timeout=...) có thể KILL tiến
+# trình con 1 cách sạch sẽ (không rò rỉ thread) khi hết giờ.
+# Không áp dụng cho upload_project()/download_project() (file/thư mục lớn,
+# chạy lâu là bình thường) — 2 hàm đó để rclone tự quản lý qua --timeout
+# (idle timeout, tự reset mỗi khi vẫn còn nhận/gửi byte).
+_SINGLE_FILE_TIMEOUT_FLOOR_SEC = 120
+_SINGLE_FILE_ASSUMED_MIN_SPEED_BYTES_PER_SEC = 1 * 1024 * 1024  # 1MB/s
 
 
-class _HardTimeout(Exception):
-    """Nội bộ: đánh dấu 1 lần gọi upload/download đã vượt quá giới hạn thời
-    gian cứng do watchdog áp đặt (xem _run_with_watchdog)."""
-    pass
+def _single_file_timeout(size_bytes: int) -> float:
+    return _SINGLE_FILE_TIMEOUT_FLOOR_SEC + max(size_bytes, 0) / _SINGLE_FILE_ASSUMED_MIN_SPEED_BYTES_PER_SEC
 
 
-_WATCHDOG_ASSUMED_MIN_SPEED_BYTES_PER_SEC = 2 * 1024 * 1024  # 2MB/s
-_WATCHDOG_BASE_TIMEOUT_SECONDS = 180  # sàn tối thiểu, đủ cho overhead + file nhỏ
+# Regex khớp dòng tổng kết số file rclone luôn in ở cuối (trừ khi chạy
+# --quiet), dạng: "Transferred:            8 / 8, 100%". Có 2 dòng bắt đầu
+# bằng "Transferred:" — 1 dòng theo BYTE (có dấu phẩy thập phân + đơn vị,
+# vd "10.567 MiB / 10.567 MiB"), 1 dòng theo SỐ FILE (số nguyên thuần).
+# Regex này chỉ khớp dòng SỐ FILE nhờ \d+ (không cho phép dấu chấm/chữ).
+_RE_TRANSFERRED_COUNT = re.compile(r"Transferred:\s*(\d+)\s*/\s*(\d+)\s*,")
+_RE_ERRORS_COUNT = re.compile(r"Errors:\s*(\d+)\b")
 
 
-def _hard_timeout_for(size_bytes: int) -> float:
-    """Tính giới hạn thời gian cứng (giây) cho 1 lần upload/download 1 file,
-    dựa trên kích thước — HOÀN TOÀN ĐỘC LẬP với connect_timeout/read_timeout
-    của botocore, và độc lập với self._io_slots/self.max_retries.
-
-    Lý do cần lớp phòng thủ NÀY, RIÊNG BIỆT với io_slots + retry hiện có: đã
-    ghi nhận trường hợp 1 phần (part) của multipart transfer bị lỗi kết nối
-    ở tầng THẤP HƠN CẢ socket timeout, khiến luồng điều phối nội bộ của
-    s3transfer (thư viện con của boto3, xử lý multipart) bị deadlock chờ mãi
-    mãi — KHÔNG ném exception, nên: (a) read_timeout không được kích hoạt,
-    (b) vòng lặp retry ở _upload_file()/_download_file() không bao giờ chạy
-    tới nhánh except để thử lại, và (c) self._io_slots.release() trong
-    finally không bao giờ được gọi, làm CẠN DẦN slot cho các file khác.
-    Vì đây là bug ở tầng thư viện bên thứ 3 (không tự sửa được), cách duy
-    nhất để CHẮC CHẮN không bao giờ treo nữa là ép 1 giới hạn thời gian từ
-    BÊN NGOÀI, không phụ thuộc vào việc boto3 có tự báo lỗi hay không."""
-    return _WATCHDOG_BASE_TIMEOUT_SECONDS + (
-        size_bytes / _WATCHDOG_ASSUMED_MIN_SPEED_BYTES_PER_SEC
-    )
-
-
-def _run_with_watchdog(fn, timeout_seconds: float, label: str) -> tuple[bool, Exception | None]:
-    """Chạy `fn()` (không tham số) trong 1 thread daemon riêng và ép giới hạn
-    thời gian cứng `timeout_seconds`. Trả về (thành_công, lỗi_nếu_có):
-      - (True, None)   : fn() chạy xong, không lỗi.
-      - (False, exc)   : fn() ném exception (lỗi thật từ boto3) — nhánh này
-        vẫn để nguyên vòng lặp retry + backoff hiện có xử lý như cũ.
-      - (False, _HardTimeout(...)) : fn() KHÔNG xong kịp trong thời hạn —
-        watchdog chủ động coi là thất bại và trả lại quyền điều khiển cho
-        luồng gọi NGAY (kể cả để chạy attempt kế tiếp hoặc release slot),
-        không chờ thread con nữa.
-
-    LƯU Ý QUAN TRỌNG: Python không có cách an toàn để kill 1 thread đang
-    chạy dở code (đặc biệt là code C bên trong boto3/s3transfer). Nếu đây
-    đúng là ca deadlock nội bộ, thread con sẽ tiếp tục tồn tại (rò rỉ) ở
-    background cho tới khi tiến trình kết thúc. Đây là đánh đổi CÓ CHỦ Ý:
-    chấp nhận rò rỉ 1 thread daemon đang bị block (không giữ tiến trình
-    sống vì là daemon, không tốn CPU vì đang chờ I/O) để đổi lấy việc luồng
-    chính — và slot trong self._io_slots — không bao giờ bị treo vô thời
-    hạn. boto3 client được thiết kế thread-safe nên 1 thread rò rỉ không
-    gây lỗi dữ liệu cho các lần gọi khác dùng chung self.client sau này."""
-    outcome: dict[str, Any] = {}
-
-    def _target():
-        try:
-            fn()
-            outcome["ok"] = True
-        except Exception as e:
-            outcome["ok"] = False
-            outcome["error"] = e
-
-    t = threading.Thread(target=_target, daemon=True, name=f"watchdog-{label}")
-    t.start()
-    t.join(timeout_seconds)
-
-    if t.is_alive():
-        print(
-            f"[cloud] CẢNH BÁO: '{label}' TREO quá {timeout_seconds:.0f}s "
-            f"(nghi bug deadlock nội bộ s3transfer, không ném exception) — "
-            f"chủ động huỷ và coi là THẤT BẠI để retry. Thread con sẽ tự rò "
-            f"rỉ ở background (không ảnh hưởng các lần gọi sau)."
-        )
-        return False, _HardTimeout(f"watchdog timeout sau {timeout_seconds:.0f}s: {label}")
-
-    if outcome.get("ok"):
-        return True, None
-    return False, outcome.get("error", RuntimeError(f"lỗi không rõ khi chạy '{label}'"))
-
-
-class _ByteProgress:
-    """Callback cho boto3 download_file/upload_file dùng cho 1 file nặng:
-    in tiến độ theo byte thật (MB đã tải/tổng MB) trên dòng log riêng, có
-    tên file để phân biệt với thanh đếm file của các file nhỏ chạy song song."""
-
-    def __init__(self, label: str, total_bytes: int):
-        self.label = label
-        self.total_bytes = max(total_bytes, 1)  # tránh chia cho 0 nếu size=0
-        self.seen = 0
-        self.start = time.time()
-
-    def __call__(self, bytes_amount: int) -> None:
-        # boto3 gọi lại nhiều lần với số byte MỚI nhận mỗi lần (không phải
-        # tổng luỹ kế), nên phải cộng dồn ở đây.
-        self.seen += bytes_amount
-        elapsed = time.time() - self.start
-        speed = self.seen / elapsed if elapsed > 0 else 0
-        print_progress_bar(
-            self.seen, self.total_bytes,
-            prefix=f"[cloud] {self.label}",
-            suffix=f"{_format_size(self.seen)}/{_format_size(self.total_bytes)}, {_format_size(speed)}/s",
-        )
+def _rclone_env(access_key: str, secret_key: str, endpoint_url: str,
+                 region_name: str, addressing_style: str) -> dict:
+    """Dựng biến môi trường cấu hình 1 remote rclone kiểu S3 hoàn toàn
+    trong bộ nhớ tiến trình con — không ghi rclone.conf ra đĩa."""
+    env = os.environ.copy()
+    prefix = f"RCLONE_CONFIG_{_REMOTE_NAME.upper()}_"
+    env[prefix + "TYPE"] = "s3"
+    # "Other" = provider S3-compatible generic, dùng được cho Tigris,
+    # Filebase, Cloudflare R2, MinIO... (không phải AWS thật, không cần
+    # các quirk riêng của preset AWS trong rclone).
+    env[prefix + "PROVIDER"] = "Other"
+    env[prefix + "ACCESS_KEY_ID"] = access_key
+    env[prefix + "SECRET_ACCESS_KEY"] = secret_key
+    env[prefix + "ENDPOINT"] = endpoint_url
+    env[prefix + "REGION"] = region_name
+    # addressing_style="virtual" (Tigris) -> force_path_style=false.
+    # addressing_style="path" (Filebase, MinIO...) -> force_path_style=true.
+    env[prefix + "FORCE_PATH_STYLE"] = "false" if addressing_style == "virtual" else "true"
+    # Không dùng bất kỳ file rclone.conf nào trên đĩa — mọi cấu hình đã đủ
+    # qua biến môi trường ở trên.
+    env["RCLONE_CONFIG"] = os.devnull
+    return env
 
 
 class CloudStorage:
     """Quản lý upload/download dữ liệu project lên/từ 1 dịch vụ lưu trữ
     tương thích S3 (mặc định: Tigris; cũng dùng được với Filebase, AWS S3,
-    Cloudflare R2, hoặc bất kỳ provider S3-compatible nào khác) qua S3 API.
+    Cloudflare R2, hoặc bất kỳ provider S3-compatible nào khác) qua rclone.
     Logic bên trong hoàn toàn generic — chỉ cấu hình lại endpoint_url/
     region_name/addressing_style trong config.toml (mục [cloud]) là dùng
     được provider khác."""
@@ -179,117 +119,85 @@ class CloudStorage:
         auto_create_bucket: bool = True,
         max_retries: int = 3,
     ):
-        if not HAS_BOTO3:
-            raise ImportError("Cần cài boto3 để dùng cloud storage. Chạy: pip install boto3")
+        if not HAS_RCLONE:
+            raise ImportError(
+                "Cần cài rclone để dùng cloud storage (không phải gói pip). "
+                "Cài đặt: curl https://rclone.org/install.sh | sudo bash "
+                "(xem thêm https://rclone.org/downloads/)"
+            )
 
-        self.access_key = access_key
-        self.secret_key = secret_key
         self.bucket_name = bucket_name
-        self.endpoint_url = endpoint_url
-        # Số lần thử lại khi 1 file upload/download thất bại (lỗi mạng tạm
-        # thời, timeout...) trước khi bỏ cuộc hẳn. Đọc từ
-        # project.cloud_sync_retries trong config.toml (xem
-        # get_cloud_storage_from_config).
+        # Số lần thử lại rclone tự làm cho MỖI file khi gặp lỗi mạng tạm
+        # thời, đọc từ project.cloud_sync_retries trong config.toml (xem
+        # get_cloud_storage_from_config) — cùng ý nghĩa như bản boto3 cũ,
+        # nhưng giờ retry nằm hẳn trong rclone (--retries), không phải vòng
+        # lặp Python tự viết.
         self.max_retries = max(0, max_retries)
+        self._env = _rclone_env(access_key, secret_key, endpoint_url, region_name, addressing_style)
+        self._remote = f"{_REMOTE_NAME}:{bucket_name}"
 
-        self.client = boto3.client(
-            "s3",
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            endpoint_url=endpoint_url,
-            # region_name/addressing_style giờ đọc từ config.toml (mục
-            # [cloud]) thay vì hard-code riêng cho Filebase, vì mỗi
-            # provider S3-compatible yêu cầu khác nhau để tính chữ ký request
-            # (SigV4) và dựng URL đúng cách:
-            #   - Filebase: region_name="us-east-1", addressing_style="path"
-            #   - Tigris:   region_name="auto",      addressing_style="virtual"
-            # Đặt sai sẽ khiến request bị ký sai hoặc gọi nhầm URL một cách
-            # âm thầm (lỗi 403/404 khó hiểu) thay vì lỗi rõ ràng.
-            region_name=region_name,
-            config=Config(
-                signature_version="s3v4",
-                s3={"addressing_style": addressing_style},
-                # BUGFIX #1: nguyên nhân gốc của "job treo hàng giờ" là số
-                # connection ĐANG MỞ đồng thời qua client này vượt quá
-                # max_pool_connections -> các luồng dư bị BLOCK VÔ THỜI HẠN
-                # chờ pool trả connection (không phải network timeout nên
-                # connect_timeout/read_timeout KHÔNG áp dụng, không có
-                # exception nào được ném ra để retry bắt được).
-                #
-                # BUGFIX #2 (2026-07): tăng max_pool_connections lên 1 con số
-                # cụ thể (32, rồi 64) KHÔNG đủ chắc chắn, vì có 2 tầng sinh
-                # connection đồng thời CỘNG DỒN vào nhau:
-                #   (a) tầng ngoài: bao nhiêu THREAD cùng gọi upload/download
-                #       cùng lúc (ThreadPoolExecutor 16 luồng trong
-                #       upload_project/download_project, HOẶC tới 40 luồng
-                #       song song từ tts.py qua checkpoint.save_micro(), HOẶC
-                #       cả 2 xảy ra cùng lúc nếu sync giữa các stage chồng
-                #       lên nhau).
-                #   (b) tầng trong: MỖI lần gọi upload_file()/download_file()
-                #       cho 1 file > multipart_threshold (mặc định 8MB), bản
-                #       thân boto3 TransferManager tự mở thêm tới 10 connection
-                #       SONG SONG cho riêng file đó để tải/tải lên theo phần
-                #       (multipart), mặc định KHÔNG bị giới hạn bởi số ta đặt
-                #       ở trên.
-                # Nếu không khống chế cả 2 tầng, tổng connection thật có thể
-                # vượt bất kỳ con số cố định nào ta đoán, tuỳ vào việc có bao
-                # nhiêu file "nặng" (video, checkpoint) tình cờ được upload
-                # cùng lúc. Cách sửa CHẮC CHẮN (không đoán số nữa):
-                #   1) Giới hạn CỨNG tầng (b): mọi lời gọi upload_file/
-                #      download_file đều truyền Config=TRANSFER_CONFIG bên
-                #      dưới, ép TransferManager chỉ dùng tối đa
-                #      _TRANSFER_MAX_CONCURRENCY (4) connection/luồng nội bộ
-                #      cho MỖI file, thay vì mặc định 10.
-                #   2) Giới hạn CỨNG tầng (a): mọi lời gọi _upload_file()/
-                #      _download_file() (bất kể gọi từ đâu — upload_project,
-                #      download_project, hay checkpoint.save_micro() của
-                #      tts.py) đều phải xin 1 "slot" từ self._io_slots
-                #      (Semaphore) TRƯỚC khi thật sự gọi boto3 — xem 2 hàm đó
-                #      bên dưới.
-                # Với _IO_SLOTS=12 slot * _TRANSFER_MAX_CONCURRENCY=4 = tối đa
-                # 48 connection dùng cho transfer thật, CỘNG thêm dư 16 cho
-                # các lời gọi nhẹ/ngắn hạn (list_objects, head_object dùng để
-                # so sánh file đã có sẵn chưa) chạy trong cùng
-                # ThreadPoolExecutor(16) mà KHÔNG qua _io_slots (vì các lời
-                # gọi này không giữ connection lâu, không phải nguồn gây treo)
-                # => max_pool_connections=64 là ĐỦ THEO CÔNG THỨC, không phải
-                # số đoán: 48 (transfer, bị self._io_slots chặn cứng ở mức
-                # này) + 16 (control-plane, bị ThreadPoolExecutor(16) chặn
-                # cứng ở mức này) = 64, KHÔNG THỂ vượt quá dù có bao nhiêu
-                # luồng gọi cùng lúc từ bất kỳ đâu trong codebase.
-                max_pool_connections=64,
-                connect_timeout=30,
-                read_timeout=120,
-                retries={"max_attempts": 3, "mode": "standard"},
-            ),
-        )
-
-        # Xem giải thích công thức ở comment BUGFIX #2 phía trên.
-        self._TRANSFER_MAX_CONCURRENCY = 4
-        self._transfer_config = TransferConfig(
-            max_concurrency=self._TRANSFER_MAX_CONCURRENCY,
-            multipart_threshold=8 * 1024 * 1024,
-            multipart_chunksize=8 * 1024 * 1024,
-        )
-        # 12 slot đồng thời tối đa cho MỌI lời gọi upload/download thật sự
-        # (bất kể gọi từ upload_project/download_project hay từ
-        # checkpoint.save_micro() của tts.py) -> 12 * 4 = 48 connection tối
-        # đa dùng cho transfer thật, xem công thức ở trên.
-        self._io_slots = threading.BoundedSemaphore(12)
-        # Timeout (giây) khi CHỜ có slot rảnh trước khi upload/download 1
-        # file. Nếu hết thời gian này mà vẫn không xin được slot (nghĩa là
-        # 12 slot đều đang bận thật sự lâu bất thường), TA CHỦ ĐỘNG bỏ cuộc
-        # và log rõ ràng, thay vì để luồng đó treo vô thời hạn như bug cũ.
-        self._IO_SLOT_WAIT_TIMEOUT = 300
-
-        # bucket_ready = bucket đã xác nhận tồn tại (hoặc vừa được tự tạo) và
-        # dùng được. Mọi hàm upload/list/download bên dưới sẽ kiểm tra cờ này
-        # trước, để báo lỗi 1 lần rõ ràng thay vì thất bại lặp lại từng file.
+        # bucket_ready = bucket đã xác nhận tồn tại (hoặc vừa được tự tạo)
+        # và dùng được. Mọi hàm upload/list/download bên dưới kiểm tra cờ
+        # này trước, để báo lỗi 1 lần rõ ràng thay vì thất bại lặp lại
+        # từng file.
         self.bucket_ready = False
         if auto_create_bucket:
             self.bucket_ready = self.ensure_bucket()
-            if self.bucket_ready:
-                self.ensure_cors()
+
+    # ------------------------------------------------------------------
+    # Tiện ích gọi rclone
+    # ------------------------------------------------------------------
+
+    def _rclone_args(self, args: list[str]) -> list[str]:
+        """Ghép flag retry/timeout mặc định (áp dụng cho MỌI lệnh) với các
+        flag riêng của từng thao tác."""
+        return [
+            RCLONE_BIN,
+            "--retries", str(self.max_retries + 1),
+            "--low-level-retries", "10",
+            "--contimeout", "30s",
+            # Idle timeout: rclone tự huỷ 1 kết nối nếu KHÔNG NHẬN thêm
+            # byte nào trong 300s — khác timeout "tổng thời gian" cứng
+            # nhắc của bản cũ, nên file vài GB tải chậm nhưng vẫn đang
+            # tiến triển sẽ KHÔNG bị giết oan.
+            "--timeout", "300s",
+            "--stats-log-level", "NOTICE",
+            *args,
+        ]
+
+    def _rclone_capture(self, args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+        """Chạy 1 lệnh rclone ngắn (list/mkdir/size/xoá...), thu toàn bộ
+        stdout/stderr để đọc kết quả."""
+        return subprocess.run(
+            self._rclone_args(args), env=self._env,
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    def _rclone_stream(self, args: list[str]) -> tuple[int, list[str]]:
+        """Chạy 1 lệnh rclone dài (copy project cả GB dữ liệu), IN TRỰC
+        TIẾP tiến độ của rclone ra console (rclone tự có --progress/
+        --stats, không cần code progress bar riêng nữa), đồng thời gom lại
+        các dòng log để đọc số liệu tổng kết ở cuối (xem
+        _RE_TRANSFERRED_COUNT). Không đặt timeout cứng ở đây — để
+        --timeout (idle timeout) của rclone tự lo, vì đây là thao tác có
+        thể chạy rất lâu với dữ liệu lớn."""
+        proc = subprocess.Popen(
+            self._rclone_args(args), env=self._env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        lines: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            print(f"[cloud] {line}")
+            lines.append(line)
+        returncode = proc.wait()
+        return returncode, lines
+
+    # ------------------------------------------------------------------
+    # Bucket
+    # ------------------------------------------------------------------
 
     def ensure_bucket(self) -> bool:
         """Kiểm tra bucket đã tồn tại chưa; nếu chưa, tự tạo trên storage.
@@ -299,537 +207,85 @@ class CloudStorage:
         khác dùng — tên bucket là DUY NHẤT TOÀN CỤC trên hầu hết dịch vụ
         tương thích S3, kể cả Filebase lẫn Tigris).
         """
-        try:
-            self.client.head_bucket(Bucket=self.bucket_name)
+        r = self._rclone_capture(["lsd", self._remote])
+        if r.returncode == 0:
             return True
-        except Exception as e:
-            error_code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
-            if error_code not in ("404", "NoSuchBucket", "NotFound", ""):
-                print(f"[cloud] Không kiểm tra được bucket '{self.bucket_name}': {e}")
-                return False
 
-        # Bucket chưa tồn tại -> thử tự tạo
-        try:
-            self.client.create_bucket(Bucket=self.bucket_name)
+        r2 = self._rclone_capture(["mkdir", self._remote])
+        if r2.returncode == 0:
             print(f"[cloud] Bucket '{self.bucket_name}' chưa có trên cloud — đã tự tạo mới.")
             return True
-        except Exception as e:
-            error_code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
-            if error_code == "BucketAlreadyOwnedByYou":
-                return True
-            if error_code == "BucketAlreadyExists":
-                print(
-                    f"[cloud] LỖI: Tên bucket '{self.bucket_name}' đã bị tài khoản "
-                    f"khác dùng (tên bucket trên storage tương thích S3 là duy nhất toàn cục, giống "
-                    f"AWS S3). Hãy đổi 'bucket_name' trong config.toml sang 1 tên khác, "
-                    f"riêng biệt cho bạn (vd 'ai-director-video-<ten-cua-ban>'), rồi chạy lại."
-                )
-            else:
-                print(f"[cloud] Không tự tạo được bucket '{self.bucket_name}': {e}")
-            return False
+
+        err = (r2.stderr or r.stderr or "").strip()
+        if "already" in err.lower() and ("own" in err.lower() or "exist" in err.lower()):
+            # Đã tồn tại (của chính mình, hoặc lsd ở trên bị lỗi tạm thời)
+            # -> coi như sẵn sàng, giống BucketAlreadyOwnedByYou của S3.
+            return True
+        if "bucketalreadyexists" in err.lower():
+            print(
+                f"[cloud] LỖI: Tên bucket '{self.bucket_name}' đã bị tài khoản "
+                f"khác dùng (tên bucket trên storage tương thích S3 là duy nhất toàn cục, giống "
+                f"AWS S3). Hãy đổi 'bucket_name' trong config.toml sang 1 tên khác, "
+                f"riêng biệt cho bạn (vd 'ai-director-video-<ten-cua-ban>'), rồi chạy lại."
+            )
+        else:
+            print(f"[cloud] Không tạo/kiểm tra được bucket '{self.bucket_name}': {err[-800:] or 'lỗi không rõ'}")
+        return False
+
+    # ------------------------------------------------------------------
+    # File đơn lẻ (dùng bởi checkpoint.py — gọi rất thường xuyên,
+    # có thể chạy song song hàng chục lần)
+    # ------------------------------------------------------------------
 
     def _upload_file(self, local_path: Path, remote_key: str) -> bool:
-        """Upload 1 file lên cloud.
-
-        BUGFIX: trước đây hàm này không kiểm tra `bucket_ready`, khác với
-        upload_project()/sync_checkpoint(). checkpoint.py gọi thẳng
-        _upload_file() sau MỖI micro-checkpoint (không qua 2 hàm trên), nên
-        nếu bucket init thất bại, mỗi lần lưu checkpoint vẫn âm thầm gọi
-        boto3 và nhận lỗi (nuốt bởi try/except ở checkpoint.py) — tốn round-trip
-        mạng vô ích suốt cả pipeline thay vì phát hiện 1 lần rồi bỏ qua.
-
-        BUGFIX #2 (2026-07): xin 1 "slot" từ self._io_slots TRƯỚC khi thật sự
-        gọi boto3 — đây là chốt chặn CỨNG duy nhất đảm bảo không bao giờ có
-        quá 12 lần upload/download thật chạy song song qua client này, bất kể
-        gọi từ đâu (upload_project's ThreadPoolExecutor, hay checkpoint.
-        save_micro() từ tối đa 40 luồng của tts.py). Nếu chờ quá
-        _IO_SLOT_WAIT_TIMEOUT giây vẫn không xin được slot, CHỦ ĐỘNG bỏ cuộc
-        (log rõ ràng) thay vì treo vô thời hạn."""
+        """Upload 1 file lên cloud. rclone tự retry nội bộ theo
+        self.max_retries (xem _rclone_args) nên không cần vòng lặp
+        backoff tự viết như bản cũ."""
         if not self.bucket_ready:
             return False
         try:
             size = local_path.stat().st_size
         except OSError:
-            size = -1
-        is_heavy = size >= HEAVY_FILE_THRESHOLD_BYTES
-
-        wait_start = time.time()
-        acquired = self._io_slots.acquire(timeout=self._IO_SLOT_WAIT_TIMEOUT)
-        wait_elapsed = time.time() - wait_start
-        if not acquired:
-            print(f"[cloud] LỖI: chờ {wait_elapsed:.0f}s vẫn KHÔNG xin được slot upload cho "
-                  f"'{remote_key}' ({_format_size(max(size, 0))}) — có quá nhiều tác vụ cloud "
-                  f"chạy song song bất thường. Bỏ qua lần thử này (sẽ được retry ở checkpoint "
-                  f"tiếp theo hoặc flush_pending_syncs()).")
-            return False
-        if wait_elapsed > 5:
-            print(f"[cloud] (đã chờ {wait_elapsed:.1f}s để có slot rảnh trước khi upload "
-                  f"'{remote_key}')")
-
-        timeout = _hard_timeout_for(max(size, 0))
-
+            size = 0
+        dest = f"{self._remote}/{remote_key}"
         try:
-            last_err: Exception | None = None
-            for attempt in range(self.max_retries + 1):
-                t0 = time.time()
-                if is_heavy:
-                    print(f"[cloud] Bắt đầu upload file nặng '{remote_key}' "
-                          f"({_format_size(size)}, lần thử {attempt + 1}/{self.max_retries + 1})...")
-                ok, err = _run_with_watchdog(
-                    lambda: self.client.upload_file(
-                        str(local_path),
-                        self.bucket_name,
-                        remote_key,
-                        Config=self._transfer_config,
-                    ),
-                    timeout,
-                    label=f"upload {remote_key}",
-                )
-                if ok:
-                    if is_heavy:
-                        dt = time.time() - t0
-                        print(f"[cloud] Upload xong file nặng '{remote_key}' "
-                              f"({_format_size(size)}) trong {dt:.1f}s.")
-                    return True
-                last_err = err
-                dt = time.time() - t0
-                print(f"[cloud] Upload lỗi cho '{remote_key}' ({_format_size(max(size, 0))}) "
-                      f"sau {dt:.1f}s (lần {attempt + 1}/{self.max_retries + 1}): {err}")
-                if attempt < self.max_retries:
-                    time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
-            print(f"[cloud] Upload thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
+            r = self._rclone_capture(["copyto", str(local_path), dest],
+                                      timeout=_single_file_timeout(size))
+        except subprocess.TimeoutExpired:
+            print(f"[cloud] Upload TIMEOUT cho '{remote_key}' (tiến trình rclone bị huỷ sạch, "
+                  f"sẽ được retry ở checkpoint tiếp theo hoặc flush_pending_syncs()).")
             return False
-        finally:
-            self._io_slots.release()
-
-    def upload_public(self, local_path: Path, remote_key: str) -> bool:
-        """Upload 1 file với ACL public-read — dự định dùng cho status.json
-        (để dashboard web/mobile đọc trực tiếp qua URL công khai, không cần
-        access_key/secret_key). Mọi file khác (video, checkpoint, output)
-        vẫn phải dùng _upload_file() (private) như cũ.
-
-        LƯU Ý: hiện KHÔNG có nơi nào trong codebase gọi hàm này (cũng như
-        ensure_cors() bên dưới) — không có status.json nào được tạo/upload,
-        và chưa có "dashboard web/mobile" nào tồn tại. Đây là tiện ích cho
-        tính năng dashboard trong tương lai, không phải bug, nhưng nếu không
-        có kế hoạch dùng thì có thể xoá 2 hàm này để đỡ gây hiểu nhầm."""
-        try:
-            self.client.upload_file(
-                str(local_path), self.bucket_name, remote_key,
-                ExtraArgs={"ACL": "public-read"},
-            )
+        if r.returncode == 0:
             return True
-        except Exception as e:
-            print(f"[cloud] Upload public thất bại cho {remote_key}: {e}")
-            return False
+        print(f"[cloud] Upload lỗi cho '{remote_key}': {(r.stderr or '').strip()[-500:]}")
+        return False
 
-    def ensure_cors(self) -> bool:
-        """Bật CORS (allow GET từ mọi origin) cho bucket, để trình duyệt
-        (dashboard web chạy trên điện thoại) fetch được status.json công khai
-        trực tiếp từ cloud. Không ảnh hưởng quyền riêng tư của các file
-        khác — CORS chỉ quyết định trình duyệt nào được ĐỌC file ĐÃ public,
-        không tự động public hoá file private."""
-        try:
-            self.client.put_bucket_cors(
-                Bucket=self.bucket_name,
-                CORSConfiguration={
-                    "CORSRules": [{
-                        "AllowedOrigins": ["*"],
-                        "AllowedMethods": ["GET"],
-                        "AllowedHeaders": ["*"],
-                        "MaxAgeSeconds": 3600,
-                    }]
-                },
-            )
-            return True
-        except Exception as e:
-            print(f"[cloud] Không bật được CORS (dashboard web có thể không đọc được status.json): {e}")
-            return False
-
-    def _download_file(self, remote_key: str, local_path: Path, callback=None) -> bool:
-        """Tải 1 file từ cloud về. `callback`, nếu có, được boto3 gọi lại
-        nhiều lần trong lúc tải với số byte MỚI nhận (không phải luỹ kế) —
-        dùng cho file nặng để in tiến độ theo byte thật (xem download_project).
-
-        BUGFIX #2 (2026-07): xin slot từ self._io_slots giống hệt
-        _upload_file() — xem docstring ở đó để biết lý do."""
+    def _download_file(self, remote_key: str, local_path: Path) -> bool:
+        """Tải 1 file từ cloud về."""
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        is_heavy = callback is not None  # download_project chỉ truyền callback cho file nặng
-
-        wait_start = time.time()
-        acquired = self._io_slots.acquire(timeout=self._IO_SLOT_WAIT_TIMEOUT)
-        wait_elapsed = time.time() - wait_start
-        if not acquired:
-            print(f"[cloud] LỖI: chờ {wait_elapsed:.0f}s vẫn KHÔNG xin được slot download cho "
-                  f"'{remote_key}' — có quá nhiều tác vụ cloud chạy song song bất thường. "
-                  f"Bỏ qua lần thử này.")
+        size = self._remote_size(remote_key) or 0
+        src = f"{self._remote}/{remote_key}"
+        try:
+            r = self._rclone_capture(["copyto", src, str(local_path)],
+                                      timeout=_single_file_timeout(size))
+        except subprocess.TimeoutExpired:
+            print(f"[cloud] Download TIMEOUT cho '{remote_key}'.")
             return False
-        if wait_elapsed > 5:
-            print(f"[cloud] (đã chờ {wait_elapsed:.1f}s để có slot rảnh trước khi tải "
-                  f"'{remote_key}')")
-
-        # BUGFIX #3 (2026-07): giới hạn thời gian cứng, độc lập với boto3 —
-        # xem docstring _run_with_watchdog. Kích thước remote lấy qua
-        # head_object (rẻ, không giữ slot lâu) để tính timeout hợp lý; nếu
-        # lỗi (hiếm), dùng size=0 -> vẫn có timeout sàn tối thiểu, an toàn
-        # hơn là không giới hạn nào.
-        size_for_timeout = self._remote_size(remote_key) or 0
-        timeout = _hard_timeout_for(size_for_timeout)
-
-        try:
-            last_err: Exception | None = None
-            for attempt in range(self.max_retries + 1):
-                t0 = time.time()
-                if is_heavy:
-                    print(f"[cloud] Bắt đầu tải file nặng '{remote_key}' "
-                          f"(lần thử {attempt + 1}/{self.max_retries + 1})...")
-                ok, err = _run_with_watchdog(
-                    lambda: self.client.download_file(
-                        self.bucket_name,
-                        remote_key,
-                        str(local_path),
-                        Callback=callback,
-                        Config=self._transfer_config,
-                    ),
-                    timeout,
-                    label=f"download {remote_key}",
-                )
-                if ok:
-                    if is_heavy:
-                        dt = time.time() - t0
-                        print(f"[cloud] Tải xong file nặng '{remote_key}' trong {dt:.1f}s.")
-                    return True
-                last_err = err
-                dt = time.time() - t0
-                print(f"[cloud] Tải lỗi cho '{remote_key}' sau {dt:.1f}s "
-                      f"(lần {attempt + 1}/{self.max_retries + 1}): {err}")
-                if attempt < self.max_retries:
-                    time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
-            print(f"[cloud] Tải thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
-            return False
-        finally:
-            self._io_slots.release()
-
-    def _list_files(self, prefix: str) -> list[str]:
-        """Liệt kê tất cả file dưới 1 prefix (thư mục) trên cloud."""
-        return [key for key, _size in self._list_files_with_size(prefix)]
-
-    def _list_files_with_size(self, prefix: str) -> list[tuple[str, int]]:
-        """Liệt kê tất cả file dưới 1 prefix, kèm kích thước (byte).
-
-        list_objects_v2 đã trả sẵn "Size" cho mỗi object trong response nên
-        không cần gọi head_object riêng cho từng file (đỡ tốn round-trip) —
-        dùng để phân loại file nhỏ/nặng trước khi tải ở download_project()."""
-        try:
-            files = []
-            paginator = self.client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                for obj in page.get("Contents", []):
-                    files.append((obj["Key"], obj.get("Size", 0)))
-            return files
-        except Exception as e:
-            print(f"[cloud] Lỗi liệt kê {prefix}: {e}")
-            return []
-
-    def _delete_file(self, remote_key: str) -> bool:
-        """Xoá 1 file trên cloud."""
-        try:
-            self.client.delete_object(Bucket=self.bucket_name, Key=remote_key)
+        if r.returncode == 0:
             return True
-        except Exception:
-            return False
-
-    def _remote_size_and_etag(self, remote_key: str) -> tuple[int, str] | None:
-        """Lấy (kích thước, ETag) của 1 object trên cloud, None nếu chưa tồn tại."""
-        try:
-            resp = self.client.head_object(Bucket=self.bucket_name, Key=remote_key)
-            return resp.get("ContentLength"), str(resp.get("ETag", "")).strip('"')
-        except Exception:
-            return None
+        print(f"[cloud] Tải lỗi cho '{remote_key}': {(r.stderr or '').strip()[-500:]}")
+        return False
 
     def _remote_size(self, remote_key: str) -> int | None:
         """Lấy kích thước (byte) của 1 object trên cloud, None nếu chưa tồn tại."""
-        try:
-            resp = self.client.head_object(Bucket=self.bucket_name, Key=remote_key)
-            return resp.get("ContentLength")
-        except Exception:
+        r = self._rclone_capture(["size", f"{self._remote}/{remote_key}", "--json"])
+        if r.returncode != 0:
             return None
-
-    @staticmethod
-    def _local_md5(path: Path) -> str:
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def upload_project(self, project_dir: Path, project_id: str, max_workers: int = 16) -> dict[str, Any]:
-        """Upload toàn bộ thư mục project (bao gồm input/ chứa video gốc,
-        checkpoints/, output/) lên cloud.
-
-        Video gốc giờ nằm trong project_dir/input/ (xem project_manager.py:
-        create_project()) nên rglob("*") ở đây tự động cuốn nó theo — không
-        cần logic upload riêng cho video. Vì video có thể rất lớn và hiếm khi
-        đổi giữa các lần sync, ta so kích thước với bản đã có trên cloud
-        (head_object) và bỏ qua nếu trùng, để tránh upload lại hàng GB không
-        cần thiết mỗi lần đồng bộ.
-
-        BUGFIX: chỉ so KÍCH THƯỚC là không đủ — 2 file khác nội dung nhưng
-        tình cờ trùng byte-size (khá dễ xảy ra với các file JSON/keyframe nhỏ,
-        vd asr_timeline.json trước và sau khi sửa 1 câu thoại có thể trùng
-        size) sẽ bị coi là "đã có sẵn" và KHÔNG được upload bản mới, khiến
-        cloud giữ mãi bản cũ mà không ai biết. Với file NHỎ (dưới ngưỡng
-        HEAVY_FILE_THRESHOLD_BYTES), khi size trùng ta so thêm MD5 cục bộ với
-        ETag trên cloud trước khi quyết định bỏ qua. Với file NẶNG (video
-        gốc, hiếm đổi, hash cả GB mỗi lần sync sẽ rất chậm), vẫn chỉ so size
-        như cũ — đây là đánh đổi có chủ đích, không phải bug.
-
-        Upload SONG SONG (giống download_project()) vì project thường có
-        hàng ngàn file keyframe nhỏ — tuần tự từng file sẽ bị chặn bởi độ
-        trễ mạng (latency) chứ không phải băng thông, dù mỗi file tự nó
-        upload nhanh."""
-        if not self.bucket_ready:
-            print(f"[cloud] Bỏ qua đồng bộ: bucket '{self.bucket_name}' chưa sẵn sàng "
-                  f"(xem lỗi ensure_bucket ở trên).")
-            return {"uploaded": 0, "skipped": 0, "errors": 0, "error_files": [],
-                    "aborted": True}
-
-        remote_prefix = f"projects/{project_id}/"
-
-        candidates = []
-        for local_file in project_dir.rglob("*"):
-            if local_file.is_dir():
-                continue
-            if local_file.name.startswith("_") and local_file.name.endswith(".json"):
-                continue
-            rel = local_file.relative_to(project_dir)
-            remote_key = f"{remote_prefix}{rel.as_posix()}"
-            candidates.append((local_file, remote_key))
-
-        total = len(candidates)
-        uploaded: list[str] = []
-        skipped: list[str] = []
-        errors: list[str] = []
-        lock = threading.Lock()
-        start = time.time()
-
-        print_progress_bar(0, total, prefix="[cloud] upload", suffix=f"0/{total} file")
-
-        def _job(local_file: Path, remote_key: str) -> tuple[str, str]:
-            """Trả về (remote_key, 'uploaded'|'skipped'|'error')."""
-            local_size = local_file.stat().st_size
-            remote = self._remote_size_and_etag(remote_key)
-            if remote is not None:
-                remote_size, remote_etag = remote
-                if remote_size == local_size:
-                    if local_size >= HEAVY_FILE_THRESHOLD_BYTES:
-                        # File nặng: chấp nhận đánh đổi, chỉ so size (xem docstring).
-                        return remote_key, "skipped"
-                    # File nhỏ/vừa: multipart ETag (chứa '-') không phải MD5
-                    # thuần -> không so được, đành upload lại cho an toàn.
-                    if "-" not in remote_etag:
-                        try:
-                            if self._local_md5(local_file) == remote_etag:
-                                return remote_key, "skipped"
-                        except OSError:
-                            pass
-            ok = self._upload_file(local_file, remote_key)
-            return remote_key, ("uploaded" if ok else "error")
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_job, lf, rk) for lf, rk in candidates]
-            done = 0
-            for future in as_completed(futures):
-                remote_key, status = future.result()
-                with lock:
-                    done += 1
-                    if status == "uploaded":
-                        uploaded.append(remote_key)
-                    elif status == "skipped":
-                        skipped.append(remote_key)
-                    else:
-                        errors.append(remote_key)
-                    elapsed = time.time() - start
-                    speed = done / elapsed if elapsed > 0 else 0
-                    print_progress_bar(
-                        done, total, prefix="[cloud] upload",
-                        suffix=f"{done}/{total} file, {speed:.1f} file/s",
-                    )
-
-        # Upload metadata của lần sync này
-        meta = {
-            "project_id": project_id,
-            "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "file_count": len(uploaded),
-            "skipped_count": len(skipped),
-            "error_count": len(errors),
-        }
-        meta_file = project_dir / "_upload_meta.json"
-        with open(meta_file, "w") as f:
-            json.dump(meta, f, indent=2)
-        self._upload_file(meta_file, f"{remote_prefix}_upload_meta.json")
-        meta_file.unlink(missing_ok=True)
-
-        elapsed = time.time() - start
-        print(f"[cloud] Upload xong trong {elapsed:.1f}s: {len(uploaded)} file tải lên, "
-              f"{len(skipped)} bỏ qua (đã có sẵn), {len(errors)} lỗi.")
-
-        return {
-            "uploaded": len(uploaded),
-            "skipped": len(skipped),
-            "errors": len(errors),
-            "error_files": errors,
-        }
-
-    def download_project(self, project_id: str, local_dir: Path, max_workers: int = 16) -> bool:
-        """Tải 1 project từ cloud về thư mục cục bộ (bao gồm input/video).
-
-        Tách làm 2 nhóm:
-          - File NHỎ (< HEAVY_FILE_THRESHOLD_BYTES, VD: keyframe .jpg): tải
-            SONG SONG bằng ThreadPoolExecutor như cũ, thanh tiến độ đếm theo
-            SỐ FILE — hợp lý vì có hàng ngàn file, mỗi file tải rất nhanh,
-            nút thắt là ĐỘ TRỄ mạng chứ không phải băng thông.
-          - File NẶNG (video gốc, checkpoint model...): tải TUẦN TỰ, SAU khi
-            nhóm file nhỏ xong, mỗi file có dòng tiến độ RIÊNG tính theo BYTE
-            THẬT (MB đã tải/tổng MB). Trước đây file nặng bị trộn chung vào
-            thanh đếm file: 1 file 1.3GB cũng chỉ tính "+1" như 1 keyframe vài
-            chục KB, nên khi tới file cuối, thanh gần như đứng im ở mốc
-            (total-1)/total trong lúc file đó vẫn đang tải thật — nhìn như bị
-            treo. Tải tuần tự (không xen với pool file nhỏ) để tránh 2 dòng
-            tiến độ \\r ghi đè lẫn nhau trên cùng 1 dòng terminal."""
-        if not self.bucket_ready:
-            print(f"[cloud] Không tải được: bucket '{self.bucket_name}' chưa sẵn sàng.")
-            return False
-        remote_prefix = f"projects/{project_id}/"
-        files = self._list_files_with_size(remote_prefix)
-        if not files:
-            print(f"[cloud] Không tìm thấy project '{project_id}'.")
-            return False
-
-        local_dir.mkdir(parents=True, exist_ok=True)
-        small_files: list[tuple[str, Path]] = []
-        heavy_files: list[tuple[str, Path, int]] = []
-        for remote_key, size in files:
-            if remote_key.endswith("/"):
-                continue
-            rel = remote_key[len(remote_prefix):]
-            if not rel or rel.startswith("_"):
-                continue
-            local_file = local_dir / rel
-            if size >= HEAVY_FILE_THRESHOLD_BYTES:
-                heavy_files.append((remote_key, local_file, size))
-            else:
-                small_files.append((remote_key, local_file))
-
-        total = len(small_files) + len(heavy_files)
-        downloaded = 0
-        failed: list[str] = []
-        lock = threading.Lock()
-        start = time.time()
-
-        # --- Nhóm 1: file nhỏ, tải song song, tiến độ theo số file ---
-        if small_files:
-            print_progress_bar(0, len(small_files), prefix="[cloud] download",
-                                suffix=f"0/{len(small_files)} file nhỏ")
-
-            def _job(remote_key: str, local_file: Path) -> tuple[str, bool]:
-                ok = self._download_file(remote_key, local_file)
-                return remote_key, ok
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = [pool.submit(_job, rk, lf) for rk, lf in small_files]
-                done_small = 0
-                for future in as_completed(futures):
-                    remote_key, ok = future.result()
-                    with lock:
-                        done_small += 1
-                        downloaded += 1
-                        if not ok:
-                            failed.append(remote_key)
-                        elapsed = time.time() - start
-                        speed = done_small / elapsed if elapsed > 0 else 0
-                        print_progress_bar(
-                            done_small, len(small_files), prefix="[cloud] download",
-                            suffix=f"{done_small}/{len(small_files)} file nhỏ, {speed:.1f} file/s",
-                        )
-
-        # --- Nhóm 2: file nặng, tải tuần tự, tiến độ theo byte thật ---
-        for i, (remote_key, local_file, size) in enumerate(heavy_files, start=1):
-            label = f"download nặng ({i}/{len(heavy_files)}) {local_file.name}"
-            print(f"[cloud] Bắt đầu tải file nặng: {local_file.name} ({_format_size(size)})")
-            progress_cb = _ByteProgress(label, size)
-            ok = self._download_file(remote_key, local_file, callback=progress_cb)
-            with lock:
-                downloaded += 1
-                if not ok:
-                    failed.append(remote_key)
-
-        elapsed = time.time() - start
-        print(f"[cloud] Đã tải {downloaded - len(failed)}/{total} file về {local_dir} "
-              f"trong {elapsed:.1f}s ({len(failed)} lỗi)" + (f": {failed[:5]}..." if failed else "."))
-        return len(failed) == 0 or (downloaded - len(failed)) > 0
-
-    def list_remote_projects(self) -> list[dict[str, Any]]:
-        """Liệt kê tất cả project đang lưu trên cloud.
-
-        Kèm theo "last_modified" (thời điểm object mới nhất được ghi, lấy
-        từ LastModified do S3 trả về) và "status" suy luận (completed/
-        in_progress/new) dựa trên các key thấy được — CẦN THIẾT cho môi
-        trường chạy không có ổ đĩa cũ (vd GitHub Actions), nơi không thể
-        dựa vào mtime file cục bộ như ProjectManager._refresh_project_meta
-        vẫn làm cho project chạy trên máy có ổ đĩa bền vững.
-        """
-        if not self.bucket_ready:
-            return []
-        projects: dict[str, dict[str, Any]] = {}
         try:
-            paginator = self.client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self.bucket_name, Prefix="projects/"):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    last_modified = obj.get("LastModified")
-                    parts = key.split("/")
-                    if len(parts) < 2:
-                        continue
-                    project_id = parts[1]
-                    p = projects.setdefault(project_id, {
-                        "project_id": project_id,
-                        "file_count": 0,
-                        "status": "new",
-                        "_last_modified_dt": None,
-                    })
-                    p["file_count"] += 1
-                    if last_modified is not None:
-                        if p["_last_modified_dt"] is None or last_modified > p["_last_modified_dt"]:
-                            p["_last_modified_dt"] = last_modified
-                    if key.endswith("output/deliverables/final_preview.mp4"):
-                        p["status"] = "completed"
-                    elif "/checkpoints/" in key and p["status"] != "completed":
-                        p["status"] = "in_progress"
-        except Exception as e:
-            print(f"[cloud] Lỗi khi liệt kê project: {e}")
-            return []
-
-        result = []
-        for p in projects.values():
-            dt = p.pop("_last_modified_dt")
-            p["last_modified"] = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
-            result.append(p)
-        return result
-
-    def delete_project(self, project_id: str) -> bool:
-        """Xoá toàn bộ 1 project trên cloud."""
-        if not self.bucket_ready:
-            print(f"[cloud] Không xoá được: bucket '{self.bucket_name}' chưa sẵn sàng.")
-            return False
-        remote_prefix = f"projects/{project_id}/"
-        files = self._list_files(remote_prefix)
-        deleted = 0
-        for key in files:
-            if self._delete_file(key):
-                deleted += 1
-        print(f"[cloud] Đã xoá {deleted} file của project '{project_id}'")
-        return deleted > 0
+            data = json.loads(r.stdout)
+            return int(data.get("bytes", 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
 
     def sync_checkpoint(self, project_dir: Path, project_id: str, stage: str,
                          checkpoint_subdir: str = "checkpoints") -> bool:
@@ -846,6 +302,206 @@ class CloudStorage:
         if ckpt_file.exists():
             remote_key = f"projects/{project_id}/checkpoints/{stage}.json"
             return self._upload_file(ckpt_file, remote_key)
+        return False
+
+    # ------------------------------------------------------------------
+    # Cả project (upload/download hàng loạt)
+    # ------------------------------------------------------------------
+
+    def upload_project(self, project_dir: Path, project_id: str, max_workers: int = 16) -> dict[str, Any]:
+        """Upload toàn bộ thư mục project (bao gồm input/ chứa video gốc,
+        checkpoints/, output/) lên cloud bằng 1 lệnh `rclone copy` duy
+        nhất.
+
+        rclone TỰ so sánh kích thước + thời gian sửa đổi (và có thể bật
+        checksum) để bỏ qua file đã có sẵn giống hệt trên cloud — thay cho
+        toàn bộ logic so ETag/MD5 thủ công ~80 dòng của bản boto3 cũ.
+        rclone cũng tự chạy song song nhiều file cùng lúc qua
+        --transfers/--checkers, và tự động cân bằng hợp lý giữa file nhỏ
+        (nhiều, cần độ trễ thấp) và file nặng (ít, cần băng thông) mà
+        không cần chia 2 nhóm thủ công như trước."""
+        if not self.bucket_ready:
+            print(f"[cloud] Bỏ qua đồng bộ: bucket '{self.bucket_name}' chưa sẵn sàng "
+                  f"(xem lỗi ensure_bucket ở trên).")
+            return {"uploaded": 0, "skipped": 0, "errors": 0, "error_files": [],
+                    "aborted": True}
+
+        dest = f"{self._remote}/projects/{project_id}"
+        print(f"[cloud] Bắt đầu đồng bộ project '{project_id}' lên cloud...")
+        start = time.time()
+        returncode, lines = self._rclone_stream([
+            "copy", str(project_dir), dest,
+            # Bỏ qua file metadata nội bộ tạm (vd _upload_meta.json cũ),
+            # giống hệt điều kiện "startswith('_') and endswith('.json')"
+            # của bản cũ. Pattern không có "/" nên rclone tự khớp ở MỌI
+            # cấp thư mục, không chỉ gốc.
+            "--exclude", "_*.json",
+            "--transfers", str(max_workers),
+            "--checkers", str(max_workers),
+            "--progress",
+            "--stats", "5s",
+        ])
+        elapsed = time.time() - start
+
+        transferred, total = self._parse_transferred_count(lines)
+        errors = self._parse_errors_count(lines)
+        ok = returncode == 0
+
+        # Upload metadata của lần sync này (file riêng, KHÔNG bị lệnh copy
+        # ở trên tự loại vì --exclude chỉ áp cho chính lệnh copy đó).
+        meta = {
+            "project_id": project_id,
+            "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "file_count": total,
+            "error_count": errors,
+        }
+        meta_file = project_dir / "_upload_meta.json"
+        with open(meta_file, "w") as f:
+            json.dump(meta, f, indent=2)
+        self._upload_file(meta_file, f"projects/{project_id}/_upload_meta.json")
+        meta_file.unlink(missing_ok=True)
+
+        print(f"[cloud] Đồng bộ xong trong {elapsed:.1f}s: {transferred}/{total} file cần cập nhật "
+              f"đã lên cloud, {errors} lỗi" + ("." if ok else " (rclone thoát với lỗi)."))
+
+        return {
+            # "uploaded": số file rclone THẬT SỰ đã transfer (đã trừ file
+            # giống hệt bản cloud, do rclone tự bỏ qua). Không còn tách
+            # riêng "skipped" như bản cũ vì rclone không tiện lộ ra số này
+            # qua output tổng kết đơn giản — giữ field "skipped" = 0 để
+            # tương thích ngược với code gọi result['skipped'].
+            "uploaded": transferred,
+            "skipped": 0,
+            "errors": errors if errors else (0 if ok else 1),
+            "error_files": [] if ok else [f"rclone thoát với mã lỗi {returncode} — xem log ở trên"],
+        }
+
+    def download_project(self, project_id: str, local_dir: Path, max_workers: int = 16) -> bool:
+        """Tải 1 project từ cloud về thư mục cục bộ (bao gồm input/video)
+        bằng 1 lệnh `rclone copy` duy nhất."""
+        if not self.bucket_ready:
+            print(f"[cloud] Không tải được: bucket '{self.bucket_name}' chưa sẵn sàng.")
+            return False
+
+        remote_prefix = f"projects/{project_id}"
+        check = self._rclone_capture(["lsjson", "--recursive", f"{self._remote}/{remote_prefix}"])
+        if check.returncode != 0 or not (check.stdout or "").strip() or check.stdout.strip() == "[]":
+            print(f"[cloud] Không tìm thấy project '{project_id}'.")
+            return False
+
+        local_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[cloud] Bắt đầu tải project '{project_id}' về {local_dir}...")
+        start = time.time()
+        returncode, lines = self._rclone_stream([
+            "copy", f"{self._remote}/{remote_prefix}", str(local_dir),
+            "--transfers", str(max_workers),
+            "--checkers", str(max_workers),
+            "--progress",
+            "--stats", "5s",
+        ])
+        elapsed = time.time() - start
+
+        transferred, total = self._parse_transferred_count(lines)
+        ok = returncode == 0
+        print(f"[cloud] Đã tải {transferred}/{total} file về {local_dir} "
+              f"trong {elapsed:.1f}s" + ("." if ok else " (rclone thoát với lỗi)."))
+        return ok
+
+    @staticmethod
+    def _parse_transferred_count(lines: list[str]) -> tuple[int, int]:
+        """Đọc số file (đã transfer / tổng số cần xử lý) từ dòng tổng kết
+        cuối cùng rclone in ra ("Transferred: X / Y, 100%"). Có thể có
+        nhiều dòng dạng này (in định kỳ mỗi --stats) — lấy dòng CUỐI CÙNG
+        vì đó là số liệu sau khi hoàn tất."""
+        transferred, total = 0, 0
+        for line in lines:
+            m = _RE_TRANSFERRED_COUNT.search(line)
+            if m:
+                transferred, total = int(m.group(1)), int(m.group(2))
+        return transferred, total
+
+    @staticmethod
+    def _parse_errors_count(lines: list[str]) -> int:
+        errors = 0
+        for line in lines:
+            m = _RE_ERRORS_COUNT.search(line)
+            if m:
+                errors = int(m.group(1))
+        return errors
+
+    # ------------------------------------------------------------------
+    # Liệt kê / xoá project trên cloud
+    # ------------------------------------------------------------------
+
+    def list_remote_projects(self) -> list[dict[str, Any]]:
+        """Liệt kê tất cả project đang lưu trên cloud.
+
+        Kèm theo "last_modified" (thời điểm object mới nhất được ghi) và
+        "status" suy luận (completed/in_progress/new) dựa trên các key
+        thấy được — CẦN THIẾT cho môi trường chạy không có ổ đĩa cũ (vd
+        GitHub Actions), nơi không thể dựa vào mtime file cục bộ như
+        ProjectManager._refresh_project_meta vẫn làm cho project chạy trên
+        máy có ổ đĩa bền vững.
+        """
+        if not self.bucket_ready:
+            return []
+        r = self._rclone_capture(["lsjson", "--recursive", f"{self._remote}/projects"])
+        if r.returncode != 0:
+            # Prefix "projects/" chưa từng có object nào -> không phải lỗi
+            # thật, chỉ là chưa có project nào trên cloud.
+            if r.stdout and r.stdout.strip() not in ("", "[]", "null"):
+                print(f"[cloud] Lỗi khi liệt kê project: {(r.stderr or '').strip()[-500:]}")
+            return []
+        try:
+            entries = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError as e:
+            print(f"[cloud] Lỗi khi liệt kê project: {e}")
+            return []
+
+        projects: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if entry.get("IsDir"):
+                continue
+            path = entry.get("Path", "")
+            parts = path.split("/")
+            if len(parts) < 2:
+                continue
+            project_id = parts[0]
+            p = projects.setdefault(project_id, {
+                "project_id": project_id,
+                "file_count": 0,
+                "status": "new",
+                "_last_modified": "",
+            })
+            p["file_count"] += 1
+            mod_time = str(entry.get("ModTime", ""))
+            if mod_time > p["_last_modified"]:
+                p["_last_modified"] = mod_time
+            if path.endswith("output/deliverables/final_preview.mp4"):
+                p["status"] = "completed"
+            elif "/checkpoints/" in path and p["status"] != "completed":
+                p["status"] = "in_progress"
+
+        result = []
+        for p in projects.values():
+            raw = p.pop("_last_modified")
+            # ModTime của rclone lsjson theo chuẩn RFC3339 (vd
+            # "2026-07-19T10:30:00.000000000+07:00") -> cắt về dạng ngắn
+            # gọn giống bản cũ để hiển thị trong menu.
+            p["last_modified"] = raw[:19].replace("T", " ") if raw else ""
+            result.append(p)
+        return result
+
+    def delete_project(self, project_id: str) -> bool:
+        """Xoá toàn bộ 1 project trên cloud."""
+        if not self.bucket_ready:
+            print(f"[cloud] Không xoá được: bucket '{self.bucket_name}' chưa sẵn sàng.")
+            return False
+        r = self._rclone_capture(["purge", f"{self._remote}/projects/{project_id}"])
+        if r.returncode == 0:
+            print(f"[cloud] Đã xoá project '{project_id}' trên cloud.")
+            return True
+        print(f"[cloud] Xoá project '{project_id}' thất bại: {(r.stderr or '').strip()[-500:]}")
         return False
 
 
@@ -889,8 +545,8 @@ def get_cloud_storage_from_config(cfg) -> CloudStorage | None:
                   f"tính năng cloud sync sẽ bị bỏ qua cho tới khi bucket được sửa "
                   f"(xem lỗi ensure_bucket ở trên).")
         return storage
-    except ImportError:
-        print("[cloud] Chưa cài boto3. Chạy: pip install boto3")
+    except ImportError as e:
+        print(f"[cloud] {e}")
         return None
     except Exception as e:
         print(f"[cloud] Khởi tạo thất bại: {e}")

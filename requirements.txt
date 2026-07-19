@@ -47,7 +47,11 @@ srt>=3.5.3
 numpy>=1.26.0
 
 # --- Cloud storage (Tigris, or any other S3-compatible provider) ---
-boto3>=1.34.0
+# Không còn boto3: cloud_storage.py giờ gọi rclone qua subprocess (đỡ phải
+# tự viết retry/watchdog cho các lỗi mạng vặt). rclone là 1 BINARY, KHÔNG
+# cài qua pip -- cài riêng trước khi chạy pipeline:
+#   Linux/macOS: curl https://rclone.org/install.sh | sudo bash
+#   Windows/khác: xem https://rclone.org/downloads/
 
 # --- Reference video (competitor plot transcript, for director_brief) ---
 # youtube-transcript-api = tầng 1 (ưu tiên, ít bị YouTube bot-detection chặn).

@@ -92,11 +92,12 @@ async def _synthesize_all(
         print_progress_bar(progress["done"], total, prefix="[tts] synthesizing", suffix=clip_id)
 
         # Micro-checkpoint NGAY sau khi câu này xong. checkpoint_mgr.save_micro()
-        # gọi boto3 đồng bộ (chặn) để upload cloud -> đẩy sang thread riêng
-        # bằng asyncio.to_thread() để KHÔNG chặn event loop, giữ đúng nhiều
-        # luồng edge-tts chạy song song thật sự thay vì bị nghẽn cổ chai ở
-        # bước ghi checkpoint (CheckpointManager đã được thêm lock để an
-        # toàn khi nhiều luồng gọi save_micro() đồng thời -- xem checkpoint.py).
+        # gọi rclone (qua subprocess, đồng bộ/chặn) để upload cloud -> đẩy
+        # sang thread riêng bằng asyncio.to_thread() để KHÔNG chặn event
+        # loop, giữ đúng nhiều luồng edge-tts chạy song song thật sự thay
+        # vì bị nghẽn cổ chai ở bước ghi checkpoint (CheckpointManager đã
+        # được thêm lock để an toàn khi nhiều luồng gọi save_micro() đồng
+        # thời -- xem checkpoint.py).
         if checkpoint_mgr is not None:
             await asyncio.to_thread(checkpoint_mgr.save_micro, "tts", clip_id, {
                 "clip_id": clip_id,
