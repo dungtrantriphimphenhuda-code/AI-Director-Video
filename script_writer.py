@@ -176,6 +176,8 @@ class LocalScriptModel:
         self._torch = None
         self._quantized = False
         self._free_vram_gb_at_load: float | None = None
+        self._free_ram_gb_at_load: float | None = None
+        self.max_model_context: int = 32768  # ghi đè thật sau khi load(), đây chỉ là giá trị an toàn mặc định
 
     def load(self) -> None:
         # Giảm phân mảnh VRAM (nguyên nhân phổ biến gây OOM dù tổng VRAM còn
@@ -190,9 +192,25 @@ class LocalScriptModel:
             self.dtype_name, torch.bfloat16
         )
 
-        from platform_utils import get_free_vram_gb
+        from platform_utils import get_free_vram_gb, get_free_ram_gb
         free_vram_gb = get_free_vram_gb() if self.device == "cuda" else None
         self._free_vram_gb_at_load = free_vram_gb
+        self._free_ram_gb_at_load = get_free_ram_gb()
+
+        if self.device == "cpu":
+            # Dùng hết số core CPU thật có cho phép nhân ma trận trong generate()
+            # — mặc định PyTorch đôi khi chỉ dùng 1 nửa core, chậm không cần thiết.
+            import os as _os
+            cpu_count = _os.cpu_count() or 4
+            torch.set_num_threads(max(1, cpu_count))
+            # bfloat16/float16 không có kernel CPU nhanh trên nhiều máy (chạy
+            # được nhưng chậm hơn hẳn float32 do thiếu tối ưu BLAS) — ép về
+            # float32 trên CPU bất kể cấu hình, và dynamic-quantize sau khi
+            # tải (xem bên dưới) để bù lại phần RAM/tốc độ.
+            if self.dtype_name != "float32":
+                print(f"[script_writer] Chạy CPU: đổi dtype '{self.dtype_name}' -> 'float32' "
+                      f"(nhanh/ổn định hơn trên CPU với hầu hết BLAS backend hiện tại).")
+            dtype = torch.float32
 
         # Nếu GPU được chọn nhưng gần như không còn VRAM trống -> rơi về CPU
         # ngay từ đầu thay vì cố tải rồi OOM (vd GPU đang bị stage khác giữ chỗ).
@@ -203,10 +221,17 @@ class LocalScriptModel:
 
         want_quant = self.quantization
         if want_quant == "auto":
-            want_quant = (
-                "4bit" if self.device == "cuda" and free_vram_gb is not None
-                and free_vram_gb < _LOW_VRAM_QUANT_THRESHOLD_GB else "none"
-            )
+            if self.device == "cuda":
+                want_quant = (
+                    "4bit" if free_vram_gb is not None and free_vram_gb < _LOW_VRAM_QUANT_THRESHOLD_GB
+                    else "none"
+                )
+            elif self.device == "cpu":
+                # CPU luôn được lợi từ dynamic int8 quantization (nhanh hơn +
+                # ít RAM hơn, không cần GPU/bitsandbytes) nên bật mặc định.
+                want_quant = "8bit"
+            else:
+                want_quant = "none"
 
         quant_config = None
         if want_quant in ("4bit", "8bit") and self.device == "cuda":
@@ -271,26 +296,62 @@ class LocalScriptModel:
 
         if self.device in ("cpu", "mps") and quant_config is None:
             self.model.to(self.device)
+
+        if want_quant in ("8bit", "4bit") and self.device == "cpu":
+            try:
+                import torch.quantization as tq
+                self.model = tq.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8)
+                self._quantized = True
+                print("[script_writer] Đã áp dụng dynamic int8 quantization cho CPU "
+                      "(giảm RAM cần thiết, tăng tốc matmul).")
+            except Exception as e:
+                print(f"[script_writer] CẢNH BÁO: không bật được CPU quantization ({e}) — "
+                      "chạy tiếp float32 đầy đủ, có thể chậm hơn trên máy yếu.")
+
         self.model.eval()
 
+        # Ngưỡng context THẬT của model (không phải con số áp đặt từ config) —
+        # dùng để tính ngân sách output động trong chat(), thay vì cắt cứng ở
+        # 1 số nhỏ tuỳ ý (vd 3000) khiến model reasoning như Qwen3 bị cắt giữa
+        # lúc đang "suy nghĩ" trước khi kịp viết JSON.
+        candidates = []
+        tok_max = getattr(self.tokenizer, "model_max_length", None)
+        if isinstance(tok_max, int) and 0 < tok_max < 10_000_000:
+            candidates.append(tok_max)
+        cfg_max = getattr(self.model.config, "max_position_embeddings", None)
+        if isinstance(cfg_max, int) and cfg_max > 0:
+            candidates.append(cfg_max)
+        self.max_model_context = min(candidates) if candidates else 32768
+
     def recommended_max_context_tokens(self, configured_default: int) -> int:
-        """Ngân sách token INPUT an toàn cho model local, dựa trên VRAM thật
-        phát hiện lúc load() thay vì 1 số cố định — máy yếu tự động dùng batch
-        nhỏ hơn (nhiều batch hơn nhưng không OOM), máy mạnh vẫn tận dụng được
-        context lớn như config yêu cầu."""
-        if self.device != "cuda" or self._free_vram_gb_at_load is None:
-            # CPU/MPS: không có ranh giới VRAM cứng như CUDA, nhưng vẫn giới
-            # hạn hợp lý để tránh generate() quá chậm / cạn RAM hệ thống.
+        """Ngân sách token INPUT an toàn cho model local, dựa trên VRAM/RAM
+        thật phát hiện lúc load() thay vì 1 số cố định — máy yếu tự động dùng
+        batch nhỏ hơn (nhiều batch hơn nhưng không OOM), máy mạnh vẫn tận
+        dụng được context lớn như config yêu cầu. Áp dụng cho cả GPU (VRAM)
+        lẫn CPU/MPS (RAM hệ thống) để chạy ổn định trên mọi loại phần cứng."""
+        if self.device == "cuda" and self._free_vram_gb_at_load is not None:
+            free_gb = self._free_vram_gb_at_load
+            # Ước lượng thô: mỗi 1K token input (KV cache, cỡ model 4B) tốn khoảng
+            # 0.35-0.5GB VRAM khi CHƯA quantize, ít hơn khi đã 4-bit. Trừ hao sẵn
+            # phần weights + generate buffer + margin an toàn trước khi chia cho
+            # chi phí/1K token, rồi lấy min với giá trị cấu hình để không vượt
+            # quá cái người dùng chủ động đặt.
+            weights_reserve_gb = 3.0 if self._quantized else 8.5
+            usable_gb = max(0.0, free_gb - weights_reserve_gb - 1.5)  # 1.5GB margin an toàn
+            cost_per_1k_tokens_gb = 0.25 if self._quantized else 0.45
+        elif self._free_ram_gb_at_load is not None:
+            # CPU/MPS: không có ranh giới cứng như CUDA OOM, nhưng RAM ít vẫn
+            # gây swap-thrash (cực chậm) hoặc bị OS kill process -> áp dụng
+            # cùng logic, chỉ đổi hằng số cho phù hợp float32/int8-quantized trên CPU.
+            free_gb = self._free_ram_gb_at_load
+            weights_reserve_gb = 2.5 if self._quantized else 9.0  # Qwen3-4B: ~9GB ở float32, ~2.5GB int8
+            usable_gb = max(0.0, free_gb - weights_reserve_gb - 2.0)  # 2GB margin (OS + process khác)
+            cost_per_1k_tokens_gb = 0.3 if self._quantized else 0.6
+        else:
+            # Không lấy được thông tin phần cứng (thiếu psutil, v.v.) -> giữ
+            # trần thận trọng thay vì tin tưởng mù quáng vào config.
             return min(configured_default, 12000)
-        free_gb = self._free_vram_gb_at_load
-        # Ước lượng thô: mỗi 1K token input (KV cache, cỡ model 4B) tốn khoảng
-        # 0.35-0.5GB VRAM khi CHƯA quantize, ít hơn khi đã 4-bit. Trừ hao sẵn
-        # phần weights + generate buffer + margin an toàn trước khi chia cho
-        # chi phí/1K token, rồi lấy min với giá trị cấu hình để không vượt
-        # quá cái người dùng chủ động đặt.
-        weights_reserve_gb = 3.0 if self._quantized else 8.5
-        usable_gb = max(0.0, free_gb - weights_reserve_gb - 1.5)  # 1.5GB margin an toàn
-        cost_per_1k_tokens_gb = 0.25 if self._quantized else 0.45
+
         est_tokens = int((usable_gb / cost_per_1k_tokens_gb) * 1000)
         est_tokens = max(1500, est_tokens)  # sàn tối thiểu để vẫn xử lý được scene
         return max(1500, min(configured_default, est_tokens))
@@ -328,7 +389,22 @@ class LocalScriptModel:
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[1]
 
-        attempt_tokens = max_new_tokens
+        # KHÔNG dùng max_new_tokens cố định từ config làm trần sinh text: Qwen3
+        # là model có khả năng suy luận, có thể cần nhiều token cho phần "suy
+        # nghĩ" trước khi viết JSON thật — cắt cứng ở 1 số nhỏ tuỳ ý (vd 3000)
+        # dễ khiến output bị cắt giữa chừng lúc đang suy luận. Thay vào đó,
+        # tính ngân sách output = TOÀN BỘ context còn lại của chính model
+        # (max_model_context - input đã dùng - margin an toàn cho token đặc
+        # biệt) — giới hạn DUY NHẤT còn lại là khả năng thật của model, không
+        # phải một con số áp đặt từ config.toml.
+        safety_margin = 32
+        context_budget = max(256, self.max_model_context - input_len - safety_margin)
+        attempt_tokens = context_budget
+        if max_new_tokens and max_new_tokens > context_budget:
+            print(f"[script_writer] Lưu ý: input dài {input_len} token, model chỉ còn "
+                  f"~{context_budget} token cho output (context thật của model = "
+                  f"{self.max_model_context}) — bỏ qua giới hạn nhỏ hơn từ cấu hình.")
+
         last_err: Exception | None = None
         for attempt in range(3):
             try:

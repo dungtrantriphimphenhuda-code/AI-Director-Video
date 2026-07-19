@@ -228,6 +228,18 @@ def _manual_rclone_instructions() -> str:
     )
 
 
+def get_free_ram_gb() -> float | None:
+    """Trả về RAM hệ thống CÒN TRỐNG (GB), hoặc None nếu không lấy được.
+    Dùng để thích ứng batch/context size khi chạy model local trên CPU/MPS
+    (không có ranh giới VRAM cứng như CUDA, nhưng vẫn có thể OOM/swap-thrash
+    nếu máy ít RAM, vd laptop 8GB)."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return None
+
+
 def get_free_vram_gb() -> float | None:
     """Trả về VRAM CÒN TRỐNG (GB) của GPU CUDA hiện tại, hoặc None nếu không
     có CUDA. Dùng để tự động chọn dtype/quantization/context-length phù hợp

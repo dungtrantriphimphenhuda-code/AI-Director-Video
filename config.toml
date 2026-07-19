@@ -67,23 +67,34 @@ max_concurrency = 40
 script_local_model_name = "Qwen/Qwen3-4B-Instruct-2507"
 script_local_device = "auto"          # auto | cuda | cpu | mps
 script_local_dtype = "bfloat16"       # bfloat16 | float16 | float32
-# Quantization để giảm VRAM cần thiết khi tải model (chỉ áp dụng khi có GPU NVIDIA):
-#   "auto" (MẶC ĐỊNH): tự bật 4-bit khi VRAM còn trống < 12GB lúc load (Colab T4
-#     dùng chung, laptop GPU 6-8GB, v.v.), giữ full-precision nếu VRAM dư dả.
-#   "4bit" | "8bit": ép luôn dùng quantization (cần package `bitsandbytes`).
+# Quantization để giảm VRAM/RAM cần thiết khi tải model:
+#   "auto" (MẶC ĐỊNH): trên GPU NVIDIA, tự bật 4-bit khi VRAM còn trống < 12GB
+#     lúc load (Colab T4 dùng chung, laptop GPU 6-8GB, v.v.), giữ full-precision
+#     nếu VRAM dư dả. Trên CPU, tự bật dynamic int8 quantization (không cần
+#     bitsandbytes/GPU) để giảm RAM và tăng tốc — luôn có lợi trên CPU nên bật
+#     mặc định. Trên MPS (Apple Silicon), giữ full-precision (chưa hỗ trợ quant).
+#   "4bit" | "8bit": ép luôn dùng quantization (GPU cần package `bitsandbytes`).
 #   "none": tắt hẳn, luôn tải full-precision theo script_local_dtype ở trên.
 # Ngoài ra, "ngân sách" context/batch (script_local_max_context_tokens bên dưới)
-# cũng được TỰ ĐỘNG giảm theo VRAM thật phát hiện lúc chạy — con số cấu hình chỉ
-# là TRẦN tối đa, không phải giá trị cố định — và nếu vẫn hết VRAM/RAM giữa lúc
-# sinh narration, pipeline tự chia nhỏ batch rồi thử lại thay vì crash (xem
-# LocalModelOOMError trong script_writer.py). Nhờ 2 lớp bảo vệ này, không cần
-# chỉnh tay theo từng loại phần cứng — script tự thích ứng.
+# cũng được TỰ ĐỘNG giảm theo VRAM/RAM THẬT phát hiện lúc chạy (cả GPU lẫn CPU/
+# MPS) — con số cấu hình chỉ là TRẦN tối đa, không phải giá trị cố định — và
+# nếu vẫn hết VRAM/RAM giữa lúc sinh narration, pipeline tự chia đôi batch rồi
+# thử lại thay vì crash (xem LocalModelOOMError trong script_writer.py). Nhờ
+# các lớp bảo vệ này, không cần chỉnh tay theo từng loại phần cứng — script tự
+# thích ứng để CHẠY ĐƯỢC trên mọi loại máy (GPU mạnh/yếu, CPU, Apple Silicon).
 script_local_quantization = "auto"    # auto | 4bit | 8bit | none
 script_local_temperature = 0.7
 script_local_top_p = 0.8
 script_local_top_k = 20
-# Số token output tối đa CHO MỖI BATCH narration khi chạy local. Local không
-# bị giới hạn context ngặt nghèo như Cerebras nên có thể để rộng rãi hơn.
+# LƯU Ý: KHÔNG còn giới hạn cứng số token output mỗi lần sinh (đã bỏ trần cũ
+# 3000). Qwen3-4B-Instruct-2507 có thể cần nhiều token cho phần suy luận nội
+# bộ trước khi viết JSON — cắt cứng ở 1 số nhỏ dễ làm output bị đứt giữa chừng.
+# Ngân sách output giờ được tính ĐỘNG trong lúc chạy = context thật của model
+# trừ đi phần input đã dùng (xem LocalScriptModel.chat trong script_writer.py)
+# — giới hạn duy nhất còn lại là khả năng thật của model, không phải cấu hình.
+# Key này chỉ còn được dùng làm "dự trù" khi tính script_local_max_context_tokens
+# bên dưới (chừa chỗ cho output khi chia batch scene ở INPUT), không phải trần
+# generate() thật sự nữa.
 script_local_max_new_tokens = 3000
 # Ngân sách token INPUT tối đa cho mỗi batch narration khi chạy local — có
 # thể để lớn hơn nhiều so với Cerebras (8192) vì không bị giới hạn context
