@@ -492,19 +492,54 @@ class MistralVisionAnalyzer:
 def _patch_moondream_class() -> None:
     """
     Monkey-patch HfMoondream (loaded via trust_remote_code) để tương thích
-    transformers 5.x. transformers 5 yêu cầu `all_tied_weights_keys` trong
-    _finalize_model_loading, nhưng code remote của moondream2 chưa có.
+    transformers 5.x. transformers 5 yêu cầu:
+      1. `all_tied_weights_keys` property trong _finalize_model_loading
+      2. `post_init()` được gọi để khởi tạo các trường nội bộ mới
+    Code remote của moondream2 (rev 2025-06-21) chưa có cả hai.
     """
     import sys
-    for mod_name, mod in sys.modules.items():
+    import inspect
+
+    for mod_name, mod in list(sys.modules.items()):
         if "transformers_modules" in mod_name and hasattr(mod, "HfMoondream"):
             cls = mod.HfMoondream
+
+            # --- Patch 1: all_tied_weights_keys property ---
             if not hasattr(cls, "all_tied_weights_keys"):
                 @property
                 def all_tied_weights_keys(self):
-                    # Trả về dict rỗng nếu model không có tied weights
                     return getattr(self, "_tied_weights_keys", {})
                 cls.all_tied_weights_keys = all_tied_weights_keys
+
+            # --- Patch 2: post_init() for transformers 5 compatibility ---
+            # transformers 5 gọi post_init() trong _finalize_model_loading
+            # để khởi tạo các trường nội bộ. Nếu class không có post_init,
+            # nó sẽ dùng post_init của PreTrainedModel (base class).
+            # Tuy nhiên, nếu HfMoondream override __init__ mà không gọi
+            # super().__init__() đúng cách, post_init có thể không được gọi.
+            # Đảm bảo post_init tồn tại và gọi được.
+            if not hasattr(cls, "post_init") or not callable(getattr(cls, "post_init", None)):
+                def post_init(self):
+                    # Gọi post_init của parent class nếu có
+                    for base in cls.__mro__[1:]:
+                        if hasattr(base, "post_init") and callable(base.post_init):
+                            try:
+                                base.post_init(self)
+                            except Exception:
+                                pass
+                            break
+                cls.post_init = post_init
+
+            # --- Patch 3: Đảm bảo _tied_weights_keys tồn tại ---
+            original_init = cls.__init__
+
+            def patched_init(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                # Đảm bảo _tied_weights_keys tồn tại sau init
+                if not hasattr(self, "_tied_weights_keys"):
+                    self._tied_weights_keys = {}
+
+            cls.__init__ = patched_init
             break
 
 
@@ -539,8 +574,14 @@ class MoondreamVisionAnalyzer:
             kwargs["revision"] = self.revision
 
         # --- Patch transformers 5.x compatibility ---
-        # Load config trước để HF tải dynamic module (hf_moondream.py) vào sys.modules
-        _ = AutoConfig.from_pretrained(self.model_name, **kwargs)
+        # BƯỚC 1: Load config để HF tải dynamic module (hf_moondream.py) vào sys.modules
+        # BƯỚC 2: Patch class TRƯỚC KHI tạo instance
+        # BƯỚC 3: Load model với class đã được patch
+        try:
+            _ = AutoConfig.from_pretrained(self.model_name, **kwargs)
+        except Exception as e:
+            print(f"[vision] Warning: Could not preload config for patching: {e}")
+
         _patch_moondream_class()
 
         # --- Tự động chọn dtype & device_map theo phần cứng ---
