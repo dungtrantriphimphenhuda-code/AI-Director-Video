@@ -17,6 +17,7 @@ Python xác định sau khi có narration, không phải do LLM tự sinh số.
 
 from __future__ import annotations
 
+import gc
 import json
 import re
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from platform_utils import resolve_torch_device
 from progress_utils import print_progress_bar
 
 
@@ -39,6 +41,22 @@ def _get_client(cfg) -> OpenAI:
 
 
 def _chat(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
+    """Gọi LLM để viết kịch bản — dispatch theo `api.script_backend`:
+      - "local" (MẶC ĐỊNH): model nhẹ chạy ngay trên máy/Colab (Qwen3-4B-Instruct-2507),
+        không cần API key, không giới hạn context nhỏ, không có rủi ro "nuốt hết
+        token vào suy luận nội bộ" như model reasoning.
+      - "cerebras": dùng lại API Cerebras như trước (đổi `api.script_backend =
+        "cerebras"` trong config.toml nếu muốn quay lại).
+    """
+    backend = cfg.get("api.script_backend", "local")
+    if backend == "local":
+        model = _get_local_model(cfg)
+        max_new_tokens = max_tokens or cfg.get("processing.script_local_max_new_tokens", 3000)
+        return model.chat(system_prompt, user_prompt, max_new_tokens)
+    return _chat_cerebras(cfg, system_prompt, user_prompt, max_tokens)
+
+
+def _chat_cerebras(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
     """Gọi Cerebras (chat completions, OpenAI-compatible).
 
     max_tokens: nếu None, dùng api.cerebras_max_tokens trong config (hành vi cũ).
@@ -52,6 +70,18 @@ def _chat(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = No
         max_tokens = cfg.get("api.cerebras_max_tokens", 8000)
     temperature = cfg.get("api.cerebras_temperature", 0.8)
 
+    # BUGFIX: model zai-glm-4.7 (mặc định trong config) là model REASONING —
+    # nó tự sinh 1 chuỗi "suy nghĩ nội bộ" (reasoning tokens) TRƯỚC KHI viết
+    # câu trả lời thật. Nếu max_tokens của 1 request nhỏ (vd 2000, dùng cho
+    # từng batch narration), phần suy nghĩ đó có thể ăn hết toàn bộ ngân sách
+    # token -> response.content rỗng -> _extract_json("") báo lỗi khó hiểu
+    # "Expecting value: line 1 column 1". Tắt hẳn reasoning cho các lệnh gọi
+    # ở đây vì ta chỉ cần JSON có cấu trúc, không cần model "suy nghĩ thành
+    # tiếng" — theo đúng khuyến nghị của Cerebras (reasoning_effort="none").
+    extra_body: dict[str, Any] = {}
+    if cfg.get("api.cerebras_disable_reasoning", True):
+        extra_body["reasoning_effort"] = "none"
+
     # Một API call không có log tải sẵn theo %, nên dùng streaming: mỗi chunk
     # nhận về là 1 tín hiệu tiến độ thật (ước lượng theo token đã nhận /
     # max_tokens), thay vì chỉ báo "vẫn đang chạy..." như Heartbeat.
@@ -64,6 +94,7 @@ def _chat(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = No
         max_tokens=max_tokens,
         temperature=temperature,
         stream=True,
+        extra_body=extra_body or None,
     )
     chunks: list[str] = []
     approx_tokens = 0
@@ -80,6 +111,129 @@ def _chat(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = No
     if approx_tokens < max_tokens:
         print_progress_bar(max_tokens, max_tokens, prefix="[script_writer] cerebras", suffix="xong")
     return "".join(chunks)
+
+
+# =============================================================================
+# Backend "local" — model nhẹ chạy ngay trên máy (mặc định Qwen3-4B-Instruct-2507)
+# =============================================================================
+#
+# Lý do đổi mặc định sang local: model reasoning qua Cerebras (zai-glm-4.7) có
+# thể "nuốt" hết ngân sách token vào suy luận nội bộ trước khi kịp viết JSON
+# (xem BUGFIX trong _chat_cerebras), đặc biệt dễ xảy ra khi narration được
+# chia thành nhiều batch nhỏ cho phim dài. Chạy local tránh hẳn vấn đề đó
+# (không cần API key, không rate limit, không giới hạn context 8K khắt khe),
+# đổi lại cần GPU/CPU đủ mạnh để tải + chạy model — Qwen3-4B-Instruct-2507
+# được chọn vì nhẹ (~4B tham số, cùng cỡ với Qwen3-VL-4B đã dùng cho vision
+# nên không tốn thêm VRAM đáng kể), nhanh, và viết văn tiếng Việt tốt. Muốn
+# quay lại Cerebras: đổi `api.script_backend = "cerebras"` trong config.toml.
+
+_local_model_singleton: "LocalScriptModel | None" = None
+
+
+class LocalScriptModel:
+    """Bọc model + tokenizer chạy local, load một lần và tái sử dụng cho toàn
+    bộ hooks + mọi batch narration của 1 project (tránh load lại model nặng
+    cho mỗi lệnh gọi)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.model_name = cfg.get("processing.script_local_model_name", "Qwen/Qwen3-4B-Instruct-2507")
+        self.cache_dir = str(cfg.resolve_path("paths.model_cache_dir"))
+        self.device = resolve_torch_device(cfg.get("processing.script_local_device", "auto"))
+        self.dtype_name = cfg.get("processing.script_local_dtype", "bfloat16")
+        self.temperature = cfg.get("processing.script_local_temperature", 0.7)
+        self.top_p = cfg.get("processing.script_local_top_p", 0.8)
+        self.top_k = cfg.get("processing.script_local_top_k", 20)
+        self.model = None
+        self.tokenizer = None
+        self._torch = None
+
+    def load(self) -> None:
+        import torch  # lazy import: chỉ cần khi thực sự dùng backend "local"
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self._torch = torch
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(
+            self.dtype_name, torch.bfloat16
+        )
+        print(f"[script_writer] Loading local model {self.model_name} on {self.device} "
+              f"({self.dtype_name})... (lần đầu sẽ tải model; log tải % / tốc độ của "
+              f"huggingface_hub sẽ hiện ngay bên dưới)")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name, cache_dir=self.cache_dir, trust_remote_code=True,
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            cache_dir=self.cache_dir,
+            torch_dtype=dtype,
+            device_map=self.device if self.device == "cuda" else None,
+            trust_remote_code=True,
+        )
+        if self.device in ("cpu", "mps"):
+            self.model.to(self.device)
+        self.model.eval()
+
+    def unload(self) -> None:
+        del self.model
+        del self.tokenizer
+        self.model = None
+        self.tokenizer = None
+        gc.collect()
+        if self._torch is not None:
+            try:
+                if self._torch.cuda.is_available():
+                    self._torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def chat(self, system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
+        """Sinh text qua chat template. Qwen3-4B-Instruct-2507 (bản "Instruct",
+        KHÔNG phải bản "Thinking") không tự chèn suy luận nội bộ vào output
+        mặc định, nên không gặp lại lỗi "nuốt hết token vào suy nghĩ" như
+        model reasoning phía Cerebras."""
+        torch = self._torch
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
+        print_progress_bar(0, 1, prefix="[script_writer] local", suffix=f"đang sinh (max {max_new_tokens} token)...")
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        print_progress_bar(1, 1, prefix="[script_writer] local", suffix="xong")
+        gen_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+        return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+
+def _get_local_model(cfg) -> "LocalScriptModel":
+    """Load model local 1 lần duy nhất (singleton cấp module) và tái sử dụng
+    cho mọi lệnh gọi tiếp theo trong cùng tiến trình (hooks + mọi batch
+    narration) — tránh tải lại model nặng nhiều lần."""
+    global _local_model_singleton
+    if _local_model_singleton is None:
+        _local_model_singleton = LocalScriptModel(cfg)
+        _local_model_singleton.load()
+    return _local_model_singleton
+
+
+def unload_local_script_model() -> None:
+    """Giải phóng model local khỏi VRAM/RAM sau khi stage 'script' xong, để
+    nhường chỗ cho các stage sau (tts, render). An toàn khi gọi dù model
+    chưa từng được load (vd đang dùng backend 'cerebras')."""
+    global _local_model_singleton
+    if _local_model_singleton is not None:
+        _local_model_singleton.unload()
+        _local_model_singleton = None
 
 
 class ScriptWriterJSONError(RuntimeError):
@@ -110,11 +264,12 @@ def _chat_json(
     max_tokens_override: int | None = None,
 ) -> Any:
     """Gọi `_chat()` rồi parse JSON qua `_extract_json()`, có retry khi JSON hỏng/bị cắt
-    (vd: output chạm `cerebras_max_tokens` giữa chừng). Nếu vẫn lỗi sau khi retry,
+    (vd: output chạm giới hạn token giữa chừng). Nếu vẫn lỗi sau khi retry,
     raise `ScriptWriterJSONError` rõ ràng thay vì để `json.JSONDecodeError` thô lọt
     ra ngoài với traceback khó hiểu.
     """
     last_err: Exception | None = None
+    current_max_tokens = max_tokens_override
     for attempt in range(max_retries + 1):
         prompt = user_prompt
         if attempt > 0:
@@ -123,7 +278,21 @@ def _chat_json(
                 "cắt giữa chừng hoặc lẫn text thừa). Lần này trả lời NGẮN GỌN HƠN nếu "
                 "cần và CHỈ trả về đúng 1 JSON hợp lệ, không thêm bất kỳ text nào khác."
             )
-        raw = _chat(cfg, system_prompt, prompt, max_tokens=max_tokens_override)
+        raw = _chat(cfg, system_prompt, prompt, max_tokens=current_max_tokens)
+        if not raw.strip():
+            # Response rỗng hoàn toàn: KHÁC với JSON bị cắt/hỏng thông thường.
+            # Nguyên nhân thường gặp nhất (model reasoning như zai-glm-4.7 qua
+            # Cerebras): toàn bộ ngân sách token bị "suy nghĩ nội bộ" ăn hết
+            # trước khi kịp viết câu trả lời. Tăng ngân sách token cho lần thử
+            # kế tiếp thay vì chỉ lặp lại y hệt (sẽ rỗng lần nữa vì cùng nguyên nhân).
+            last_err = json.JSONDecodeError("Expecting value", "", 0)
+            print(f"[script_writer] CẢNH BÁO: LLM ở stage '{stage}' trả về RỖNG "
+                  f"(lần thử {attempt + 1}/{max_retries + 1}) — có thể do ngân sách token "
+                  f"bị dùng hết cho suy luận nội bộ trước khi viết câu trả lời.")
+            if current_max_tokens:
+                current_max_tokens = min(int(current_max_tokens * 2), 16000)
+                print(f"[script_writer] Tăng ngân sách token cho lần thử kế tiếp lên ~{current_max_tokens}.")
+            continue
         try:
             return _extract_json(raw)
         except json.JSONDecodeError as e:
@@ -131,10 +300,12 @@ def _chat_json(
             print(f"[script_writer] CẢNH BÁO: JSON từ LLM ở stage '{stage}' bị hỏng/cắt "
                   f"(lần thử {attempt + 1}/{max_retries + 1}): {e}")
     raise ScriptWriterJSONError(
-        f"Stage '{stage}': LLM liên tục trả về JSON hỏng/bị cắt sau "
-        f"{max_retries + 1} lần thử ({last_err}). Có thể do cerebras_max_tokens quá "
-        f"thấp so với độ dài yêu cầu — thử tăng 'api.cerebras_max_tokens' trong "
-        f"config.toml, hoặc chạy lại (lỗi mạng/API tạm thời)."
+        f"Stage '{stage}': LLM liên tục trả về JSON hỏng/rỗng sau "
+        f"{max_retries + 1} lần thử ({last_err}). Nếu đang dùng backend 'cerebras' với "
+        f"model reasoning (vd zai-glm-4.7), thử tăng "
+        f"'api.cerebras_narration_batch_max_tokens' (hoặc 'api.cerebras_max_tokens') trong "
+        f"config.toml, hoặc chuyển hẳn sang backend 'local' ('api.script_backend = \"local\"') "
+        f"để tránh vấn đề này. Cũng có thể do lỗi mạng/API tạm thời — thử chạy lại."
     ) from last_err
 
 
@@ -323,8 +494,16 @@ def generate_narration(
     narration_language = task_config.get("narration_language", "Vietnamese")
 
     # ---- Ngân sách token cho phần scene blocks trong mỗi batch ----
-    max_context_tokens = cfg.get("api.cerebras_max_context_tokens", 8192)
-    batch_output_tokens = cfg.get("api.cerebras_narration_batch_max_tokens", 2000)
+    # Backend-aware: local không bị giới hạn context ngặt nghèo như Cerebras
+    # (8192), nên dùng ngân sách lớn hơn nhiều -> ít batch hơn, nhanh hơn, và
+    # narration mạch lạc hơn vì model thấy nhiều scene liền một lúc.
+    backend = cfg.get("api.script_backend", "local")
+    if backend == "local":
+        max_context_tokens = cfg.get("processing.script_local_max_context_tokens", 24000)
+        batch_output_tokens = cfg.get("processing.script_local_max_new_tokens", 3000)
+    else:
+        max_context_tokens = cfg.get("api.cerebras_max_context_tokens", 8192)
+        batch_output_tokens = cfg.get("api.cerebras_narration_batch_max_tokens", 2000)
     base_system_prompt = _narration_system_prompt(narration_language, is_continuation=False)
     fixed_overhead_tokens = (
         _estimate_tokens(base_system_prompt)
@@ -593,10 +772,17 @@ def run_script_writer(
     pipeline_dir = output_dir / "pipeline"
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[script_writer] Generating narration via Cerebras...")
-    narration_sentences = generate_narration(
-        cfg, semantic_blocks, task_config, hook, director_brief, checkpoint_mgr=checkpoint_mgr,
-    )
+    backend = cfg.get("api.script_backend", "local")
+    print(f"[script_writer] Generating narration (backend='{backend}')...")
+    try:
+        narration_sentences = generate_narration(
+            cfg, semantic_blocks, task_config, hook, director_brief, checkpoint_mgr=checkpoint_mgr,
+        )
+    finally:
+        # Giải phóng model local (nếu có) ngay sau khi dùng xong, để nhường
+        # VRAM/RAM cho các stage sau (tts, render) — an toàn khi backend là
+        # 'cerebras' (hàm tự bỏ qua nếu chưa từng load model local).
+        unload_local_script_model()
 
     print(f"[script_writer] {len(narration_sentences)} câu narration được sinh. Building storyboard...")
     storyboard = build_storyboard(cfg, task_config, narration_sentences, semantic_blocks)

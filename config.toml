@@ -4,12 +4,27 @@
 # =============================================================================
 
 [api]
-# Cerebras API for script writing (Gemma 4 31B)
+# ---- Backend viết kịch bản (hooks + narration) ----
+# "local" (MẶC ĐỊNH): chạy model nhẹ ngay trên máy/Colab, không cần API key,
+#   không có rủi ro "context_length_exceeded" hay "model reasoning nuốt hết
+#   token" mà backend cerebras từng gặp với phim nhiều scene. Xem
+#   [processing] script_local_* bên dưới để đổi model/device.
+# "cerebras": dùng lại API Cerebras như bản gốc — đổi về giá trị này nếu bạn
+#   muốn quay lại (vẫn được hỗ trợ đầy đủ, đã vá lỗi reasoning bên dưới).
+script_backend = "local"
+
+# Cerebras API for script writing (chỉ dùng khi script_backend = "cerebras")
 cerebras_api_key = "csk-vdmwee9e6kpmpyxdcfkvrxrcyhekh5w6vk39nwfc9wxmpkhk"
 cerebras_base_url = "https://api.cerebras.ai/v1"
 cerebras_model = "zai-glm-4.7"
 cerebras_max_tokens = 8000
 cerebras_temperature = 0.8
+# zai-glm-4.7 là model REASONING (tự "suy nghĩ nội bộ" trước khi trả lời).
+# Với các lệnh gọi ở đây ta chỉ cần JSON có cấu trúc, không cần suy luận
+# thành tiếng — tắt nó đi để tránh lỗi "response rỗng vì hết ngân sách token
+# cho suy luận" (xem BUGFIX trong script_writer.py). Đổi false nếu muốn giữ
+# reasoning (không khuyến khích, tốn token + dễ lỗi hơn cho tác vụ JSON).
+cerebras_disable_reasoning = true
 # Context window THẬT của model Cerebras đang dùng (input+output cộng lại).
 # Dùng để chia semantic blocks thành nhiều batch nhỏ khi sinh narration cho
 # phim dài (xem BUGFIX trong script_writer.py: trước đây dồn hết 1600+ scene
@@ -45,6 +60,25 @@ pitch = "+0Hz"
 max_concurrency = 40
 
 [processing]
+# ---- Script writing (hooks + narration), backend "local" ----
+# Model nhẹ/nhanh, viết tiếng Việt tốt, không cần API key/không rate limit.
+# Cùng cỡ (~4B) với model vision local (Qwen3-VL-4B) nên không tốn thêm
+# nhiều VRAM — model được giải phóng ngay sau khi stage 'script' xong.
+script_local_model_name = "Qwen/Qwen3-4B-Instruct-2507"
+script_local_device = "auto"          # auto | cuda | cpu | mps
+script_local_dtype = "bfloat16"       # bfloat16 | float16 | float32
+script_local_temperature = 0.7
+script_local_top_p = 0.8
+script_local_top_k = 20
+# Số token output tối đa CHO MỖI BATCH narration khi chạy local. Local không
+# bị giới hạn context ngặt nghèo như Cerebras nên có thể để rộng rãi hơn.
+script_local_max_new_tokens = 3000
+# Ngân sách token INPUT tối đa cho mỗi batch narration khi chạy local — có
+# thể để lớn hơn nhiều so với Cerebras (8192) vì không bị giới hạn context
+# ngặt nghèo, giúp ít batch hơn (nhanh hơn, mạch truyện liền lạc hơn vì model
+# thấy nhiều scene cùng lúc). Giảm nếu máy ít VRAM/RAM và gặp OOM.
+script_local_max_context_tokens = 24000
+
 # ---- ASR (faster-whisper) ----
 asr_model_size = "small"          # tiny/base/small/medium/large-v3
 asr_device = "auto"               # auto | cuda | cpu
