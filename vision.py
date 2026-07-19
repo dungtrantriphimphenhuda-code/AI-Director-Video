@@ -488,6 +488,26 @@ class MistralVisionAnalyzer:
 # vì API gốc của Moondream2 (encode_image + answer_question) chỉ nhận 1 ảnh/
 # câu hỏi — nên implement analyze_scene() đơn lẻ (không có analyze_batch),
 # và chỉ đọc 1 keyframe đại diện/scene (frame ở giữa danh sách keyframes).
+
+def _patch_moondream_class() -> None:
+    """
+    Monkey-patch HfMoondream (loaded via trust_remote_code) để tương thích
+    transformers 5.x. transformers 5 yêu cầu `all_tied_weights_keys` trong
+    _finalize_model_loading, nhưng code remote của moondream2 chưa có.
+    """
+    import sys
+    for mod_name, mod in sys.modules.items():
+        if "transformers_modules" in mod_name and hasattr(mod, "HfMoondream"):
+            cls = mod.HfMoondream
+            if not hasattr(cls, "all_tied_weights_keys"):
+                @property
+                def all_tied_weights_keys(self):
+                    # Trả về dict rỗng nếu model không có tied weights
+                    return getattr(self, "_tied_weights_keys", {})
+                cls.all_tied_weights_keys = all_tied_weights_keys
+            break
+
+
 class MoondreamVisionAnalyzer:
     """Bọc model Moondream2, load một lần và tái sử dụng cho toàn bộ scene."""
 
@@ -504,21 +524,47 @@ class MoondreamVisionAnalyzer:
 
     def load(self) -> None:
         import torch  # lazy import: chỉ cần khi thực sự dùng backend "moondream"
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
         self._torch = torch
 
         print(f"[vision] Loading {self.model_name} (rev={self.revision or 'main'}) "
               f"on {self.device} (backend=moondream, 1 keyframe/scene)... "
               f"(lần đầu sẽ tải model; nhẹ hơn Qwen3-VL-4B nhiều nên tải nhanh hơn)")
 
-        kwargs: dict[str, Any] = {"trust_remote_code": True, "cache_dir": self.cache_dir}
+        kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "cache_dir": self.cache_dir,
+        }
         if self.revision:
             kwargs["revision"] = self.revision
 
+        # --- Patch transformers 5.x compatibility ---
+        # Load config trước để HF tải dynamic module (hf_moondream.py) vào sys.modules
+        _ = AutoConfig.from_pretrained(self.model_name, **kwargs)
+        _patch_moondream_class()
+
+        # --- Tự động chọn dtype & device_map theo phần cứng ---
+        if self.device == "cuda":
+            # CUDA: dùng float16 (hoặc bfloat16 nếu GPU hỗ trợ) + device_map để tự động phân bổ
+            if torch.cuda.is_bf16_supported():
+                kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                kwargs["torch_dtype"] = torch.float16
+            kwargs["device_map"] = "auto"
+        elif self.device == "mps":
+            # Apple Silicon: bfloat16 ổn định hơn float16 trên MPS
+            kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            # CPU: float32 để tránh lỗi precision một số op không hỗ trợ int8/fp16 trên CPU
+            kwargs["torch_dtype"] = torch.float32
+
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, **kwargs)
-        if self.device in ("cpu", "mps"):
+
+        # Nếu không dùng device_map (cpu/mps), đảm bảo model nằm đúng device
+        if "device_map" not in kwargs:
             self.model.to(self.device)
+
         self.model.eval()
 
     def unload(self) -> None:
