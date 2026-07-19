@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -50,6 +52,10 @@ def _checkpoint_subdir_name(cfg) -> str:
 def ensure_python_packages(cfg=None) -> None:
     """Kiểm tra và cài đặt các package cần thiết."""
     checks = {
+        # FunASR = ASR chính (processing.asr_backend = "funasr" mặc định),
+        # faster_whisper = phương án dự phòng tự động (xem asr.py) -> cả 2
+        # đều cần được cài, dù chỉ 1 backend chạy thật trong mỗi lần dùng.
+        "funasr": "funasr",
         "faster_whisper": "faster-whisper",
         "scenedetect": "scenedetect",
         "cv2": "opencv-python",
@@ -114,52 +120,69 @@ def ensure_python_packages(cfg=None) -> None:
               f"pip install \"transformers<5.0.0\" --upgrade rồi khởi động lại runtime.")
 
 
-def ask_task_config(cfg, project_reference_urls: list[str] | None = None) -> dict:
-    """Thu thập cấu hình nội dung từ người dùng.
+def ask_task_config(cfg, project_meta: dict | None = None) -> dict:
+    """Lắp ráp cấu hình nội dung cho pipeline.
 
-    project_reference_urls: link đối thủ đã được nhập RIÊNG cho project này
-    lúc tạo project (xem menu "1. Tạo project mới"). Nếu đã có, dùng luôn,
-    KHÔNG hỏi lại và KHÔNG rơi về danh sách chung trong config.toml — vì mỗi
-    project/video thường có đối thủ khác nhau.
+    QUAN TRỌNG: tên phim/video, tóm tắt cốt truyện, và link đối thủ CHỈ được
+    hỏi 1 LẦN DUY NHẤT — lúc tạo project (menu "1. Tạo project mới", xem
+    project_manager.create_project). Hàm này KHÔNG hỏi lại bất kỳ câu nào ở
+    đây nữa, chỉ đọc lại những gì đã lưu trong metadata của project
+    (_project_meta.json) để dùng xuyên suốt các lần chạy/resume project đó —
+    tránh phải nhập lại thông tin mỗi lần pipeline chạy tới stage "reference"
+    hay "script".
     """
+    project_meta = project_meta or {}
     task_config = {
         "narration_pov": cfg.get("processing.narration_pov", "third_person"),
         "content_type": cfg.get("processing.content_type", "movie"),
         "genre": cfg.get("processing.genre", "drama"),
         "narration_language": cfg.get("processing.narration_language", "Vietnamese"),
         "target_duration_sec": cfg.get("processing.target_duration_sec", 180),
+        "title": project_meta.get("title", ""),
+        "plot_summary": project_meta.get("plot_summary", ""),
+        # Nếu project không có link đối thủ riêng (bỏ trống lúc tạo), rơi về
+        # danh sách chung [reference].urls trong config.toml (nếu có).
+        "reference_urls": project_meta.get("reference_urls") or cfg.get("reference.urls", []),
     }
-
-    interactive = sys.stdin.isatty()
-    if not interactive:
-        print("[task] Non-interactive: dùng giá trị mặc định từ config.toml")
-        task_config["title"] = ""
-        task_config["plot_summary"] = ""
-        task_config["reference_urls"] = project_reference_urls or cfg.get("reference.urls", [])
-        return task_config
-
-    print("\n" + "=" * 60)
-    print("  CẤU HÌNH NỘI DUNG (Enter để dùng mặc định)")
-    print("=" * 60)
-    task_config["title"] = input("  Tên phim/video: ").strip()
-    task_config["plot_summary"] = input("  Tóm tắt cốt truyện (tuỳ chọn): ").strip()
-    if project_reference_urls:
-        # Đã nhập lúc tạo project -> dùng luôn, không hỏi lại lần nữa.
-        print(f"  Link đối thủ: dùng {len(project_reference_urls)} link đã nhập lúc tạo project.")
-        task_config["reference_urls"] = project_reference_urls
-        return task_config
-    ref_input = input(
-        "  Link video tham khảo (đối thủ, cách nhau bởi dấu phẩy, tuỳ chọn): "
-    ).strip()
-    if ref_input:
-        task_config["reference_urls"] = [u.strip() for u in ref_input.split(",") if u.strip()]
-    else:
-        task_config["reference_urls"] = cfg.get("reference.urls", [])
     return task_config
 
 
+def _input_with_timeout(prompt: str, timeout: float) -> str | None:
+    """input() có timeout. Trả về None nếu hết thời gian mà người dùng chưa
+    nhập gì (thay vì chặn vô thời hạn như input() thuần).
+
+    Dùng thread nền để đọc stdin: select() trên stdin chỉ hoạt động trên
+    Unix, không có trên Windows, nên không dùng được cho toàn bộ các nền
+    tảng mà project này hỗ trợ (Colab, Linux, macOS, Windows — xem
+    docstring đầu run.py). Nếu timeout xảy ra, thread đọc bị bỏ lại
+    (daemon=True) — không sao vì lúc đó chương trình chính đã dùng phương
+    án tự động và không còn chờ giá trị từ thread này nữa.
+    """
+    result_queue: queue.Queue[str] = queue.Queue()
+
+    def _read() -> None:
+        try:
+            result_queue.put(input(prompt))
+        except Exception:
+            result_queue.put("")
+
+    thread = threading.Thread(target=_read, daemon=True)
+    thread.start()
+    try:
+        return result_queue.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
 def choose_hook(cfg, task_config: dict) -> str | None:
-    """Sinh và chọn câu hook mở đầu."""
+    """Sinh và chọn câu hook mở đầu.
+
+    hooks đã được generate_hooks() sắp xếp giảm dần theo "potential_score"
+    -> hooks[0] luôn là hook TIỀM NĂNG NHẤT (không chỉ là hook đầu tiên).
+    Đây cũng là hook được tự động chọn nếu người dùng nhấn Enter, chạy
+    non-interactive, HOẶC không nhập gì trong vòng
+    `processing.hook_selection_timeout_sec` giây (mặc định 300s = 5 phút).
+    """
     from script_writer import generate_hooks
 
     try:
@@ -172,16 +195,30 @@ def choose_hook(cfg, task_config: dict) -> str | None:
         return None
 
     interactive = sys.stdin.isatty()
-    print("\n=== Các câu Hook mở đầu ===")
+    print("\n=== Các câu Hook mở đầu (đã sắp xếp theo tiềm năng viral, cao nhất trước) ===")
     for i, h in enumerate(hooks, start=1):
-        print(f"  {i}. [{h.get('style', '')}] {h.get('text', '')}")
+        score = h.get("potential_score")
+        score_label = f", tiềm năng {score}/10" if score is not None else ""
+        print(f"  {i}. [{h.get('style', '')}{score_label}] {h.get('text', '')}")
 
     if not interactive:
         chosen = hooks[0]["text"]
-        print(f"\n[hook] Tự động chọn #1: {chosen}")
+        print(f"\n[hook] Tự động chọn #1 (tiềm năng nhất): {chosen}")
         return chosen
 
-    choice = input("\n  Chọn số thứ tự hook (Enter cho #1): ").strip()
+    timeout_sec = cfg.get("processing.hook_selection_timeout_sec", 300)
+    timeout_min = timeout_sec / 60
+    choice = _input_with_timeout(
+        f"\n  Chọn số thứ tự hook (Enter cho #1; tự động chọn #1 nếu không "
+        f"nhập gì trong {timeout_min:g} phút): ",
+        timeout=timeout_sec,
+    )
+    if choice is None:
+        chosen = hooks[0]["text"]
+        print(f"\n[hook] Hết {timeout_min:g} phút chưa nhập -> tự động chọn hook tiềm năng "
+              f"nhất (#1): {chosen}")
+        return chosen
+    choice = choice.strip()
     if not choice:
         return hooks[0]["text"]
     try:
@@ -246,13 +283,16 @@ def run_project_menu(cfg, cloud: CloudStorage | None) -> None:
                 print("  Đã huỷ.")
                 continue
             video_path = input("  Đường dẫn file video (Enter để bỏ qua): ").strip()
-            title = input("  Tên project (Enter để dùng ID): ").strip()
+            title = input("  Tên project / Tên phim/video (Enter để dùng ID): ").strip()
+            plot_summary = input("  Tóm tắt cốt truyện (tuỳ chọn): ").strip()
             ref_input = input(
                 "  Link video tham khảo (đối thủ, cách nhau bởi dấu phẩy, tuỳ chọn): "
             ).strip()
             reference_urls = [u.strip() for u in ref_input.split(",") if u.strip()]
             try:
-                project_dir = pm.create_project(project_id, video_path, title, reference_urls)
+                project_dir = pm.create_project(
+                    project_id, video_path, title, reference_urls, plot_summary,
+                )
                 print(f"  Đã tạo: {project_dir}")
                 # Đẩy ngay lên cloud khi vừa tạo — không bắt người dùng
                 # phải nhớ vào lại menu "5. Đồng bộ" mới có project trên
@@ -543,15 +583,15 @@ def run_pipeline_on_project(cfg, pm: ProjectManager, project_id: str, cloud: Clo
         has_checkpoint=False,
     )
 
-    # task_config chỉ nên hỏi người dùng 1 LẦN dù được dùng ở cả 2 stage
-    # ("reference" và "script") — nếu 1 trong 2 đã có checkpoint và bị skip,
-    # ask_task_config() sẽ không được gọi lần nào; nếu cả 2 đều chạy thật,
-    # cache dưới đây đảm bảo chỉ hỏi 1 lần.
+    # ask_task_config() không hỏi người dùng gì nữa (title/plot_summary/
+    # reference_urls đã được hỏi 1 lần lúc tạo project) — cache dưới đây chỉ
+    # để tránh đọc lại project meta nhiều lần khi cả 2 stage ("reference" và
+    # "script") đều dùng chung task_config trong cùng 1 lần chạy pipeline.
     _task_config_cache: dict[str, dict] = {}
 
     def _get_task_config() -> dict:
         if "value" not in _task_config_cache:
-            _task_config_cache["value"] = ask_task_config(cfg, meta.get("reference_urls"))
+            _task_config_cache["value"] = ask_task_config(cfg, meta)
         return _task_config_cache["value"]
 
     def _run_reference():

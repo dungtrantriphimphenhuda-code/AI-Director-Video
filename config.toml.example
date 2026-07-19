@@ -30,7 +30,22 @@ volume = "+0%"
 pitch = "+0Hz"
 
 [processing]
-# ---- ASR (faster-whisper) ----
+# ---- ASR ----
+# "funasr" (MẶC ĐỊNH): dùng FunASR (Paraformer/SenseVoice) làm ASR chính.
+# "whisper": dùng thẳng faster-whisper, bỏ qua FunASR hoàn toàn.
+# Nếu asr_backend="funasr" mà bị lỗi (thiếu package `funasr`, lỗi tải model,
+# lỗi lúc transcribe...) thì asr.py sẽ TỰ ĐỘNG fallback sang faster-whisper —
+# chỉ cần đổi giá trị này nếu muốn tắt hẳn FunASR, không cần sửa code.
+asr_backend = "funasr"
+
+# ---- ASR — FunASR (backend chính) ----
+asr_funasr_model = "paraformer-zh"    # hoặc "iic/SenseVoiceSmall" (đa ngôn ngữ)
+asr_funasr_vad_model = "fsmn-vad"
+asr_funasr_punc_model = "ct-punc"
+asr_funasr_device = "auto"            # auto | cuda | cpu
+asr_funasr_language = "auto"          # auto | zh | en | ja | ko | yue (tuỳ model)
+
+# ---- ASR — faster-whisper (phương án dự phòng / asr_backend="whisper") ----
 asr_model_size = "small"          # tiny/base/small/medium/large-v3
 asr_device = "auto"               # auto | cuda | cpu
 asr_compute_type = "auto"         # auto | float16 | int8
@@ -69,6 +84,10 @@ narration_pov = "third_person"    # third_person | first_person
 content_type = "movie"            # movie | tv_drama | anime | short_drama | foreign_language_commentary
 genre = "drama"
 target_duration_sec = 180
+# Sau khi sinh 10 hook mở đầu (đã sắp xếp theo tiềm năng viral), nếu chạy
+# tương tác nhưng không nhập số thứ tự trong bấy nhiêu giây, tự động chọn
+# hook #1 (tiềm năng cao nhất) — giống như nhấn Enter.
+hook_selection_timeout_sec = 300   # 5 phút
 chars_per_sec = 4.0                # tốc độ đọc ước tính CHO VĂN BẢN CHỮ HÁN (số ký tự/giây)
 words_per_sec = 2.5                 # tốc độ đọc ước tính CHO TIẾNG VIỆT/TIẾNG ANH (số từ/giây)
 buffer_after_speech = 0.1
@@ -85,8 +104,11 @@ auto_sync_cloud = true
 [reference]
 # Link video tham khảo (đối thủ) để AI đối chiếu đúng tên nhân vật/cốt
 # truyện khi viết narration — KHÔNG dùng để sao chép văn phong (xem
-# reference_video.py). Có thể để trống và nhập trực tiếp lúc chạy pipeline
-# (menu sẽ hỏi, cách nhau bởi dấu phẩy nếu nhiều link).
+# reference_video.py). Có thể để trống ở đây và nhập trực tiếp lúc TẠO
+# PROJECT (menu "1. Tạo project mới" sẽ hỏi, cách nhau bởi dấu phẩy nếu
+# nhiều link) — link đối thủ chỉ được hỏi 1 lần lúc đó, KHÔNG hỏi lại khi
+# chạy/resume pipeline sau này. Danh sách `urls` bên dưới chỉ dùng làm
+# fallback CHUNG cho project nào không nhập link riêng lúc tạo.
 urls = []
 # Ngôn ngữ phụ đề ưu tiên khi lấy transcript (thử lần lượt theo thứ tự).
 languages = ["vi", "en"]

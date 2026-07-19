@@ -9,6 +9,15 @@ tomli>=2.0.1; python_version < "3.11"
 psutil>=5.9.0
 
 # --- ASR ---
+# FunASR = backend CHÍNH (processing.asr_backend = "funasr", mặc định trong
+# config.toml). faster-whisper vẫn được giữ lại làm PHƯƠNG ÁN DỰ PHÒNG: nếu
+# FunASR lỗi lúc chạy (thiếu package, lỗi tải/model, lỗi transcribe), asr.py
+# tự động fallback sang faster-whisper — nên faster-whisper luôn phải được
+# cài, kể cả khi bạn dự định dùng FunASR làm chính.
+# Đổi processing.asr_backend = "whisper" trong config.toml nếu muốn bỏ hẳn
+# FunASR (không bắt buộc gỡ package funasr, chỉ cần đổi config).
+funasr>=1.1.0
+modelscope>=1.9.0
 faster-whisper>=1.2.1
 
 # --- Scene detection / video processing ---

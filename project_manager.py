@@ -190,6 +190,7 @@ class ProjectManager:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "video_path": "",
             "title": project_dir.name,
+            "plot_summary": "",
             "status": "unknown",
             "last_modified": "",
             "stages_completed": [],
@@ -199,12 +200,16 @@ class ProjectManager:
         return self._refresh_project_meta(project_dir, meta)
 
     def create_project(self, project_id: str, video_path: str = "", title: str = "",
-                        reference_urls: list[str] | None = None) -> Path:
+                        reference_urls: list[str] | None = None, plot_summary: str = "") -> Path:
         """Tạo thư mục project mới với đầy đủ cấu trúc con.
 
         reference_urls: link video đối thủ (tuỳ chọn) — lưu RIÊNG cho project
         này (khác project khác có thể có đối thủ khác), thay vì phải dùng
         chung 1 danh sách cố định trong config.toml cho mọi project.
+
+        title/plot_summary: tên phim/video và tóm tắt cốt truyện — được hỏi
+        1 LẦN DUY NHẤT ở đây, lúc tạo project (không hỏi lại lúc chạy
+        pipeline), rồi tái sử dụng cho mọi lần chạy/resume project này.
         """
         project_dir = self.base_dir / project_id
         if project_dir.exists():
@@ -239,6 +244,7 @@ class ProjectManager:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "video_path": rel_video_path,
             "title": title or project_id,
+            "plot_summary": plot_summary or "",
             "status": "new",
             "last_modified": time.strftime("%Y-%m-%d %H:%M:%S"),
             "stages_completed": [],

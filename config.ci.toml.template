@@ -30,7 +30,20 @@ volume = "+0%"
 pitch = "+0Hz"
 
 [processing]
-# ---- ASR (faster-whisper) ----
+# ---- ASR ----
+# CI dùng thẳng "whisper" (faster-whisper): máy ảo GitHub Actions không có
+# GPU và không nên tải thêm các model FunASR (VAD/punc/ASR riêng, khá nặng)
+# mỗi lần chạy CI — nếu cần test FunASR, đổi sang "funasr" và tự chấp nhận
+# thời gian tải model lâu hơn. asr.py vẫn tự fallback về whisper nếu funasr
+# lỗi, nên đổi giá trị này là đủ, không cần sửa code.
+asr_backend = "whisper"
+asr_funasr_model = "paraformer-zh"
+asr_funasr_vad_model = "fsmn-vad"
+asr_funasr_punc_model = "ct-punc"
+asr_funasr_device = "cpu"
+asr_funasr_language = "auto"
+
+# ---- ASR — faster-whisper ----
 asr_model_size = "small"
 asr_device = "cpu"          # máy ảo GitHub Actions KHÔNG có GPU -> luôn "cpu"
 asr_compute_type = "int8"   # int8 nhanh hơn trên CPU so với float16
@@ -67,6 +80,10 @@ narration_pov = "third_person"
 content_type = "movie"
 genre = "drama"
 target_duration_sec = 180
+# CI luôn chạy non-interactive (không có TTY) -> giá trị này thực tế không
+# được dùng tới (hook #1 được chọn ngay lập tức), giữ lại chỉ để nhất quán
+# với config.toml/config.toml.example.
+hook_selection_timeout_sec = 300
 chars_per_sec = 4.0
 words_per_sec = 2.5
 buffer_after_speech = 0.1

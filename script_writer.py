@@ -544,7 +544,15 @@ def _chat_json(
 def generate_hooks(cfg, task_config: dict[str, Any], director_brief: str = "") -> list[dict[str, str]]:
     """
     Sinh 10 câu hook mở đầu theo 4 hướng (phản差+爽点, 荒诞, 悬念, 提问, 数据)
-    như mô tả trong skill.md Step 3. Trả về list [{"style": ..., "text": ...}].
+    như mô tả trong skill.md Step 3. Trả về list [{"style": ..., "text": ...,
+    "potential_score": ...}], đã SẮP XẾP GIẢM DẦN theo "potential_score"
+    (hook có tiềm năng viral cao nhất luôn ở vị trí #1).
+
+    Việc sắp xếp này quan trọng vì run.choose_hook() dùng hook #1 làm lựa
+    chọn mặc định — cả khi người dùng nhấn Enter lẫn khi người dùng không
+    nhập gì trong thời gian chờ (xem processing.hook_selection_timeout_sec) —
+    nên #1 luôn phải là hook tiềm năng nhất, không chỉ là hook đầu tiên LLM
+    liệt kê ra.
     """
     narration_language = task_config.get("narration_language", "Vietnamese")
     system_prompt = (
@@ -555,7 +563,10 @@ def generate_hooks(cfg, task_config: dict[str, Any], director_brief: str = "") -
         f"language cannot be used as-is. "
         "Respond ONLY with a JSON array of 10 objects: "
         '[{"style": "contrast|absurd|suspense|question|data", "text": "...", '
-        '"language_used": "..."}]. '
+        '"language_used": "...", "potential_score": 1-10}]. '
+        '"potential_score" is YOUR honest estimate of how likely this specific hook is '
+        "to stop someone from scrolling in the first 1-2 seconds (10 = extremely likely). "
+        "Vary the scores realistically, don't give every hook the same score. "
         "No extra text."
     )
     user_prompt = (
@@ -567,7 +578,12 @@ def generate_hooks(cfg, task_config: dict[str, Any], director_brief: str = "") -
         "3 contrast/payoff twists, 3 absurd/dramatic, 2 suspense/conflict, "
         "1 question-style, 1 data+emotion. No slow build-up, no cliché openers."
     )
-    return _chat_json(cfg, system_prompt, user_prompt, stage="hooks")
+    hooks = _chat_json(cfg, system_prompt, user_prompt, stage="hooks")
+    if isinstance(hooks, list):
+        # Hook thiếu "potential_score" (model bỏ sót field) -> xếp cuối thay
+        # vì coi là điểm cao nhất, tránh 1 hook không chấm điểm bị đẩy lên #1.
+        hooks.sort(key=lambda h: h.get("potential_score", 0) if isinstance(h, dict) else 0, reverse=True)
+    return hooks
 
 
 def _estimate_tokens(text: str) -> int:

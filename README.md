@@ -9,7 +9,7 @@ Output: A new video with AI-generated voiceover commentary, properly synced with
 
 **Pipeline stages:**
 1. **Preprocess** — Probe video, extract audio, detect scenes, extract keyframes
-2. **ASR** — Speech-to-text transcription using faster-whisper
+2. **ASR** — Speech-to-text transcription using FunASR (primary, `processing.asr_backend`), automatically falling back to faster-whisper if FunASR fails to load or errors out
 3. **Vision** — AI analyzes each scene's visual content
 4. **Semantic Graph** — Combines audio + visual analysis into structured blocks
 5. **Reference** — (optional) fetches transcripts from reference/competitor video links, so the script writer knows the plot accurately
@@ -176,7 +176,8 @@ When you continue a project:
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `asr_model_size` | Whisper model size | `small` |
+| `asr_backend` | ASR engine: `funasr` (primary) or `whisper` | `funasr` |
+| `asr_model_size` | Whisper model size (used when `asr_backend="whisper"`, or as automatic fallback if FunASR fails) | `small` |
 | `vision_backend` | Vision analysis backend | `mistral` |
 | `micro_checkpoint_interval` | Checkpoint frequency | `1` |
 | `narration_pov` | Narration point of view | `third_person` |

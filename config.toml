@@ -102,7 +102,28 @@ script_local_max_new_tokens = 3000
 # thấy nhiều scene cùng lúc). Giảm nếu máy ít VRAM/RAM và gặp OOM.
 script_local_max_context_tokens = 24000
 
-# ---- ASR (faster-whisper) ----
+# ---- ASR ----
+# "funasr" (MẶC ĐỊNH): dùng FunASR (Paraformer/SenseVoice) làm ASR chính.
+# "whisper": dùng thẳng faster-whisper, bỏ qua FunASR hoàn toàn.
+# Dù chọn giá trị nào, nếu asr_backend="funasr" mà bị lỗi ở bất kỳ bước nào
+# (thiếu package `funasr`, lỗi tải model, lỗi lúc transcribe...) thì asr.py
+# sẽ TỰ ĐỘNG fallback sang faster-whisper (log rõ lý do fallback) — không
+# cần sửa code, chỉ cần đổi asr_backend ở đây nếu muốn tắt hẳn FunASR.
+asr_backend = "funasr"
+
+# ---- ASR — FunASR (backend chính) ----
+# Model nhận dạng chính. "paraformer-zh" tối ưu cho tiếng Trung; nếu nội
+# dung/audio nguồn không phải tiếng Trung, đổi sang "iic/SenseVoiceSmall"
+# (đa ngôn ngữ: zh/en/ja/ko/yue, KHÔNG có tiếng Việt chính thức — với
+# asr_language="vi" như mặc định bên dưới, cân nhắc set asr_backend="whisper"
+# hoặc để asr_funasr_language="auto" và kiểm tra chất lượng output thực tế).
+asr_funasr_model = "paraformer-zh"
+asr_funasr_vad_model = "fsmn-vad"     # tách câu/đoạn im lặng trước khi nhận dạng
+asr_funasr_punc_model = "ct-punc"     # tự chèn dấu câu vào transcript
+asr_funasr_device = "auto"            # auto | cuda | cpu
+asr_funasr_language = "auto"          # auto | zh | en | ja | ko | yue (tuỳ model)
+
+# ---- ASR — faster-whisper (phương án dự phòng / asr_backend="whisper") ----
 asr_model_size = "small"          # tiny/base/small/medium/large-v3
 asr_device = "auto"               # auto | cuda | cpu
 asr_compute_type = "auto"         # auto | float16 | int8
@@ -173,6 +194,12 @@ genre = "drama"
 # tiếng Việt.
 narration_language = "Vietnamese"
 target_duration_sec = 180
+# Sau khi sinh 10 hook mở đầu (đã sắp xếp theo tiềm năng viral, xem
+# script_writer.generate_hooks), nếu chạy tương tác nhưng người dùng KHÔNG
+# nhập số thứ tự trong vòng bấy nhiêu giây, tự động chọn hook #1 (tiềm năng
+# cao nhất) — giống hệt như nhấn Enter. Không ảnh hưởng chế độ
+# non-interactive (đã tự chọn #1 ngay, không chờ).
+hook_selection_timeout_sec = 300   # 5 phút
 chars_per_sec = 4.0                # CJK characters per second
 words_per_sec = 2.5                 # Vietnamese/English words per second
 buffer_after_speech = 0.1
