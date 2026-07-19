@@ -26,6 +26,7 @@ from typing import Any
 try:
     import boto3
     from botocore.config import Config
+    from boto3.s3.transfer import TransferConfig
     HAS_BOTO3 = True
 except ImportError:
     HAS_BOTO3 = False
@@ -129,37 +130,78 @@ class CloudStorage:
             config=Config(
                 signature_version="s3v4",
                 s3={"addressing_style": addressing_style},
-                # BUGFIX: upload_project()/download_project() chạy song song
-                # với ThreadPoolExecutor(max_workers=...) (mặc định 16), nhưng
-                # botocore mặc định chỉ cho phép 10 connection đồng thời
-                # (max_pool_connections=10). Khi số luồng > số connection
-                # trong pool, các luồng dư ra bị BLOCK VÔ THỜI HẠN chờ pool
-                # trả connection — đây KHÔNG phải network timeout nên
-                # connect_timeout/read_timeout không áp dụng, và không có
-                # exception nào được ném ra để retry logic trong _upload_file
-                # bắt được. Kết quả: job treo hàng giờ ở gần 100% (vd 6438/6441)
-                # cho tới khi bị hủy ngoài ý muốn (GitHub Actions timeout-minutes).
-                # Đặt max_pool_connections dư dả (>= mức concurrency lớn nhất có
-                # thể dùng TRONG TOÀN BỘ codebase, không chỉ riêng
-                # upload_project/download_project) để loại bỏ tình trạng nghẽn cổ
-                # chai này. Đồng thời set rõ connect_timeout/read_timeout để các
-                # request thực sự bị treo do mạng (không phải do nghẽn pool) sẽ tự
-                # lỗi và được retry thay vì treo vô thời hạn.
+                # BUGFIX #1: nguyên nhân gốc của "job treo hàng giờ" là số
+                # connection ĐANG MỞ đồng thời qua client này vượt quá
+                # max_pool_connections -> các luồng dư bị BLOCK VÔ THỜI HẠN
+                # chờ pool trả connection (không phải network timeout nên
+                # connect_timeout/read_timeout KHÔNG áp dụng, không có
+                # exception nào được ném ra để retry bắt được).
                 #
-                # BUGFIX #2 (2026-07): 32 vẫn KHÔNG đủ — tts.py chạy tối đa
-                # tts.max_concurrency (mặc định 40, xem config.toml) luồng song
-                # song, mỗi luồng tự gọi checkpoint_mgr.save_micro() -> thẳng
-                # _upload_file() dùng CHUNG client này, NGOÀI phạm vi
-                # upload_project()/download_project(). 40 > 32 khiến 8 luồng dư
-                # bị treo vô thời hạn y hệt bug đã mô tả ở trên, đúng vào lúc
-                # chạy TTS (thường ngay sau khi vừa tải project xong). Đặt 64 để
-                # có dư nhiều cho mọi nơi gọi cloud hiện tại và tương lai.
+                # BUGFIX #2 (2026-07): tăng max_pool_connections lên 1 con số
+                # cụ thể (32, rồi 64) KHÔNG đủ chắc chắn, vì có 2 tầng sinh
+                # connection đồng thời CỘNG DỒN vào nhau:
+                #   (a) tầng ngoài: bao nhiêu THREAD cùng gọi upload/download
+                #       cùng lúc (ThreadPoolExecutor 16 luồng trong
+                #       upload_project/download_project, HOẶC tới 40 luồng
+                #       song song từ tts.py qua checkpoint.save_micro(), HOẶC
+                #       cả 2 xảy ra cùng lúc nếu sync giữa các stage chồng
+                #       lên nhau).
+                #   (b) tầng trong: MỖI lần gọi upload_file()/download_file()
+                #       cho 1 file > multipart_threshold (mặc định 8MB), bản
+                #       thân boto3 TransferManager tự mở thêm tới 10 connection
+                #       SONG SONG cho riêng file đó để tải/tải lên theo phần
+                #       (multipart), mặc định KHÔNG bị giới hạn bởi số ta đặt
+                #       ở trên.
+                # Nếu không khống chế cả 2 tầng, tổng connection thật có thể
+                # vượt bất kỳ con số cố định nào ta đoán, tuỳ vào việc có bao
+                # nhiêu file "nặng" (video, checkpoint) tình cờ được upload
+                # cùng lúc. Cách sửa CHẮC CHẮN (không đoán số nữa):
+                #   1) Giới hạn CỨNG tầng (b): mọi lời gọi upload_file/
+                #      download_file đều truyền Config=TRANSFER_CONFIG bên
+                #      dưới, ép TransferManager chỉ dùng tối đa
+                #      _TRANSFER_MAX_CONCURRENCY (4) connection/luồng nội bộ
+                #      cho MỖI file, thay vì mặc định 10.
+                #   2) Giới hạn CỨNG tầng (a): mọi lời gọi _upload_file()/
+                #      _download_file() (bất kể gọi từ đâu — upload_project,
+                #      download_project, hay checkpoint.save_micro() của
+                #      tts.py) đều phải xin 1 "slot" từ self._io_slots
+                #      (Semaphore) TRƯỚC khi thật sự gọi boto3 — xem 2 hàm đó
+                #      bên dưới.
+                # Với _IO_SLOTS=12 slot * _TRANSFER_MAX_CONCURRENCY=4 = tối đa
+                # 48 connection dùng cho transfer thật, CỘNG thêm dư 16 cho
+                # các lời gọi nhẹ/ngắn hạn (list_objects, head_object dùng để
+                # so sánh file đã có sẵn chưa) chạy trong cùng
+                # ThreadPoolExecutor(16) mà KHÔNG qua _io_slots (vì các lời
+                # gọi này không giữ connection lâu, không phải nguồn gây treo)
+                # => max_pool_connections=64 là ĐỦ THEO CÔNG THỨC, không phải
+                # số đoán: 48 (transfer, bị self._io_slots chặn cứng ở mức
+                # này) + 16 (control-plane, bị ThreadPoolExecutor(16) chặn
+                # cứng ở mức này) = 64, KHÔNG THỂ vượt quá dù có bao nhiêu
+                # luồng gọi cùng lúc từ bất kỳ đâu trong codebase.
                 max_pool_connections=64,
                 connect_timeout=30,
                 read_timeout=120,
                 retries={"max_attempts": 3, "mode": "standard"},
             ),
         )
+
+        # Xem giải thích công thức ở comment BUGFIX #2 phía trên.
+        self._TRANSFER_MAX_CONCURRENCY = 4
+        self._transfer_config = TransferConfig(
+            max_concurrency=self._TRANSFER_MAX_CONCURRENCY,
+            multipart_threshold=8 * 1024 * 1024,
+            multipart_chunksize=8 * 1024 * 1024,
+        )
+        # 12 slot đồng thời tối đa cho MỌI lời gọi upload/download thật sự
+        # (bất kể gọi từ upload_project/download_project hay từ
+        # checkpoint.save_micro() của tts.py) -> 12 * 4 = 48 connection tối
+        # đa dùng cho transfer thật, xem công thức ở trên.
+        self._io_slots = threading.BoundedSemaphore(12)
+        # Timeout (giây) khi CHỜ có slot rảnh trước khi upload/download 1
+        # file. Nếu hết thời gian này mà vẫn không xin được slot (nghĩa là
+        # 12 slot đều đang bận thật sự lâu bất thường), TA CHỦ ĐỘNG bỏ cuộc
+        # và log rõ ràng, thay vì để luồng đó treo vô thời hạn như bug cũ.
+        self._IO_SLOT_WAIT_TIMEOUT = 300
 
         # bucket_ready = bucket đã xác nhận tồn tại (hoặc vừa được tự tạo) và
         # dùng được. Mọi hàm upload/list/download bên dưới sẽ kiểm tra cờ này
@@ -215,24 +257,66 @@ class CloudStorage:
         _upload_file() sau MỖI micro-checkpoint (không qua 2 hàm trên), nên
         nếu bucket init thất bại, mỗi lần lưu checkpoint vẫn âm thầm gọi
         boto3 và nhận lỗi (nuốt bởi try/except ở checkpoint.py) — tốn round-trip
-        mạng vô ích suốt cả pipeline thay vì phát hiện 1 lần rồi bỏ qua."""
+        mạng vô ích suốt cả pipeline thay vì phát hiện 1 lần rồi bỏ qua.
+
+        BUGFIX #2 (2026-07): xin 1 "slot" từ self._io_slots TRƯỚC khi thật sự
+        gọi boto3 — đây là chốt chặn CỨNG duy nhất đảm bảo không bao giờ có
+        quá 12 lần upload/download thật chạy song song qua client này, bất kể
+        gọi từ đâu (upload_project's ThreadPoolExecutor, hay checkpoint.
+        save_micro() từ tối đa 40 luồng của tts.py). Nếu chờ quá
+        _IO_SLOT_WAIT_TIMEOUT giây vẫn không xin được slot, CHỦ ĐỘNG bỏ cuộc
+        (log rõ ràng) thay vì treo vô thời hạn."""
         if not self.bucket_ready:
             return False
-        last_err: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                self.client.upload_file(
-                    str(local_path),
-                    self.bucket_name,
-                    remote_key,
-                )
-                return True
-            except Exception as e:
-                last_err = e
-                if attempt < self.max_retries:
-                    time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
-        print(f"[cloud] Upload thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
-        return False
+        try:
+            size = local_path.stat().st_size
+        except OSError:
+            size = -1
+        is_heavy = size >= HEAVY_FILE_THRESHOLD_BYTES
+
+        wait_start = time.time()
+        acquired = self._io_slots.acquire(timeout=self._IO_SLOT_WAIT_TIMEOUT)
+        wait_elapsed = time.time() - wait_start
+        if not acquired:
+            print(f"[cloud] LỖI: chờ {wait_elapsed:.0f}s vẫn KHÔNG xin được slot upload cho "
+                  f"'{remote_key}' ({_format_size(max(size, 0))}) — có quá nhiều tác vụ cloud "
+                  f"chạy song song bất thường. Bỏ qua lần thử này (sẽ được retry ở checkpoint "
+                  f"tiếp theo hoặc flush_pending_syncs()).")
+            return False
+        if wait_elapsed > 5:
+            print(f"[cloud] (đã chờ {wait_elapsed:.1f}s để có slot rảnh trước khi upload "
+                  f"'{remote_key}')")
+
+        try:
+            last_err: Exception | None = None
+            for attempt in range(self.max_retries + 1):
+                t0 = time.time()
+                if is_heavy:
+                    print(f"[cloud] Bắt đầu upload file nặng '{remote_key}' "
+                          f"({_format_size(size)}, lần thử {attempt + 1}/{self.max_retries + 1})...")
+                try:
+                    self.client.upload_file(
+                        str(local_path),
+                        self.bucket_name,
+                        remote_key,
+                        Config=self._transfer_config,
+                    )
+                    if is_heavy:
+                        dt = time.time() - t0
+                        print(f"[cloud] Upload xong file nặng '{remote_key}' "
+                              f"({_format_size(size)}) trong {dt:.1f}s.")
+                    return True
+                except Exception as e:
+                    last_err = e
+                    dt = time.time() - t0
+                    print(f"[cloud] Upload lỗi cho '{remote_key}' ({_format_size(max(size, 0))}) "
+                          f"sau {dt:.1f}s (lần {attempt + 1}/{self.max_retries + 1}): {e}")
+                    if attempt < self.max_retries:
+                        time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
+            print(f"[cloud] Upload thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
+            return False
+        finally:
+            self._io_slots.release()
 
     def upload_public(self, local_path: Path, remote_key: str) -> bool:
         """Upload 1 file với ACL public-read — dự định dùng cho status.json
@@ -281,24 +365,55 @@ class CloudStorage:
     def _download_file(self, remote_key: str, local_path: Path, callback=None) -> bool:
         """Tải 1 file từ cloud về. `callback`, nếu có, được boto3 gọi lại
         nhiều lần trong lúc tải với số byte MỚI nhận (không phải luỹ kế) —
-        dùng cho file nặng để in tiến độ theo byte thật (xem download_project)."""
+        dùng cho file nặng để in tiến độ theo byte thật (xem download_project).
+
+        BUGFIX #2 (2026-07): xin slot từ self._io_slots giống hệt
+        _upload_file() — xem docstring ở đó để biết lý do."""
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        last_err: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                self.client.download_file(
-                    self.bucket_name,
-                    remote_key,
-                    str(local_path),
-                    Callback=callback,
-                )
-                return True
-            except Exception as e:
-                last_err = e
-                if attempt < self.max_retries:
-                    time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
-        print(f"[cloud] Tải thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
-        return False
+        is_heavy = callback is not None  # download_project chỉ truyền callback cho file nặng
+
+        wait_start = time.time()
+        acquired = self._io_slots.acquire(timeout=self._IO_SLOT_WAIT_TIMEOUT)
+        wait_elapsed = time.time() - wait_start
+        if not acquired:
+            print(f"[cloud] LỖI: chờ {wait_elapsed:.0f}s vẫn KHÔNG xin được slot download cho "
+                  f"'{remote_key}' — có quá nhiều tác vụ cloud chạy song song bất thường. "
+                  f"Bỏ qua lần thử này.")
+            return False
+        if wait_elapsed > 5:
+            print(f"[cloud] (đã chờ {wait_elapsed:.1f}s để có slot rảnh trước khi tải "
+                  f"'{remote_key}')")
+
+        try:
+            last_err: Exception | None = None
+            for attempt in range(self.max_retries + 1):
+                t0 = time.time()
+                if is_heavy:
+                    print(f"[cloud] Bắt đầu tải file nặng '{remote_key}' "
+                          f"(lần thử {attempt + 1}/{self.max_retries + 1})...")
+                try:
+                    self.client.download_file(
+                        self.bucket_name,
+                        remote_key,
+                        str(local_path),
+                        Callback=callback,
+                        Config=self._transfer_config,
+                    )
+                    if is_heavy:
+                        dt = time.time() - t0
+                        print(f"[cloud] Tải xong file nặng '{remote_key}' trong {dt:.1f}s.")
+                    return True
+                except Exception as e:
+                    last_err = e
+                    dt = time.time() - t0
+                    print(f"[cloud] Tải lỗi cho '{remote_key}' sau {dt:.1f}s "
+                          f"(lần {attempt + 1}/{self.max_retries + 1}): {e}")
+                    if attempt < self.max_retries:
+                        time.sleep(min(2 ** attempt, 10))  # backoff: 1s, 2s, 4s... tối đa 10s
+            print(f"[cloud] Tải thất bại cho {remote_key} sau {self.max_retries + 1} lần thử: {last_err}")
+            return False
+        finally:
+            self._io_slots.release()
 
     def _list_files(self, prefix: str) -> list[str]:
         """Liệt kê tất cả file dưới 1 prefix (thư mục) trên cloud."""
