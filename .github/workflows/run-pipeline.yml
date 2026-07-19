@@ -1,153 +1,108 @@
 name: Run AI Director Video Pipeline
 
-# ---------------------------------------------------------------------------
-# KHI NÀO CHẠY:
-#   1. push        -> mỗi khi bạn push code lên nhánh main
-#   2. workflow_dispatch -> bấm tay ở tab "Actions" trên GitHub
-#   3. schedule    -> tự động mỗi ngày lúc 8:00 sáng giờ Việt Nam
-#      (cron chạy theo giờ UTC: 8:00 ICT = 01:00 UTC -> "0 1 * * *")
-#
-# MỖI LẦN CHẠY: tự động chọn project MỚI NHẤT trong số project CHƯA hoàn
-# thành (xem ci_run_latest_project.py) và chạy tiếp pipeline từ checkpoint
-# gần nhất — không cần bạn chọn tay project nào.
-# ---------------------------------------------------------------------------
-
+# Chạy khi: push lên main, bấm tay (Actions -> Run workflow), hoặc theo lịch
+# 08:00 sáng (giờ Việt Nam, UTC+7) mỗi ngày = 01:00 UTC.
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+    paths-ignore:
+      - "**.md"
   schedule:
-    # Lưới an toàn: nếu vì lý do gì đó chuỗi tự-trigger bên dưới bị đứt
-    # (hết quota phút Actions/tháng, GitHub lỗi...), vẫn có 1 lần chạy/ngày.
     - cron: "0 1 * * *"
+  workflow_dispatch: {}
 
-# Không cho 2 lần chạy chồng lên nhau (vd push đúng lúc job tự-trigger chạy) —
-# xếp hàng chạy tuần tự để tránh 2 job cùng ghi đè 1 project trên cloud.
+# Không cho 2 lần chạy chồng lên nhau (vd. vừa push vừa tới giờ lịch chạy
+# cùng lúc) — job sau xếp hàng chờ thay vì chạy song song và tranh checkpoint
+# trên cùng 1 project.
 concurrency:
   group: ai-director-pipeline
   cancel-in-progress: false
 
-permissions:
-  actions: write   # cần để step "trigger lại" gọi được workflow_dispatch
-  contents: read
-
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    # Giới hạn cứng của GitHub Actions là 6 giờ/job (360 phút). Đặt 350 để
-    # job tự dừng sớm hơn 1 chút, có thời gian in log gọn gàng thay vì bị
-    # GitHub ngắt đột ngột.
+    # Giới hạn cứng của GitHub Actions là 6 giờ/job (360 phút) và không thể
+    # tăng — đặt 350 để job tự dừng sớm hơn vài phút, đủ thời gian ghi
+    # checkpoint cuối cùng và upload log gọn gàng thay vì bị kill giữa chừng.
     timeout-minutes: 350
 
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Cài Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Cài FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg gettext-base
-
-      - name: Cài rclone (cần cho cloud_storage.py, không phải gói pip)
-        run: curl https://rclone.org/install.sh | sudo bash
-
-      - name: Cài thư viện Python
+        # Cài trước bằng sudo ở đây để platform_utils.ensure_ffmpeg() trong
+        # code (gọi "apt-get" KHÔNG có sudo) thấy ffmpeg đã sẵn sàng và bỏ
+        # qua bước tự cài của nó — chạy "apt-get" không sudo trên runner sẽ
+        # bị lỗi quyền (permission denied) vì user chạy job không phải root.
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Cài Python dependencies
+        run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Kiểm tra config.toml đã có trong repo
+      - name: Kiểm tra config.toml đã có sẵn trong repo chưa
+        # Hỗ trợ cả 2 cách README mô tả: (a) commit thẳng config.toml thật
+        # (README có cảnh báo, không khuyến khích với repo public), hoặc
+        # (b) dùng config.ci.toml.template + GitHub Secrets (khuyến khích).
+        # Nếu config.toml đã được checkout ra từ repo, dùng luôn, không ghi
+        # đè bằng bản render từ Secrets (tránh phải thiết lập Secrets nếu
+        # người dùng đã chọn cách (a)).
+        id: check_config
         run: |
-          if [ ! -f config.toml ]; then
-            echo "LỖI: không tìm thấy config.toml trong repo."
-            echo "Bạn cần commit file config.toml (đã điền key thật) lên repo."
-            exit 1
+          if [ -f config.toml ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "[ci] Tìm thấy config.toml có sẵn trong repo — dùng luôn, bỏ qua bước dựng từ Secrets."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "Đã tìm thấy config.toml."
 
-      - name: Chạy pipeline (tự chọn project mới nhất chưa xong)
+      - name: Dựng config.toml từ Secrets
+        if: steps.check_config.outputs.exists == 'false'
         env:
-          # Tắt progress bar tải model / cảnh báo verbose của HF & transformers
-          # (moondream tải qua HF) -> đỡ rác log.
-          HF_HUB_DISABLE_PROGRESS_BARS: "1"
-          TRANSFORMERS_VERBOSITY: "error"
-          TOKENIZERS_PARALLELISM: "false"
-        run: |
-          # Toàn bộ log của lệnh này được gom vào 1 khối gập lại trên GitHub
-          # Actions UI (bấm mới bung ra) bằng ::group::/::endgroup::, KHÔNG
-          # cần sửa file .py nào cả.
-          #
-          # Đồng thời lọc bớt các dòng progress bar/heartbeat lặp lại bằng awk:
-          # - Pipeline tự in progress bar dùng \r (không xuống dòng thật) ->
-          #   `tr '\r' '\n'` tách chúng thành từng dòng riêng để lọc được.
-          # - Với dòng có dạng "...NN.N% (a/b)...": chỉ giữ lại khi % vượt
-          #   thêm 1 mốc 5% so với lần in trước CỦA CÙNG PREFIX (chữ trước
-          #   dấu "[" đầu tiên, vd "[vision]", "[tts]"...).
-          # - Với dòng heartbeat "vẫn đang chạy... Ns" (không có %): chỉ giữ
-          #   1 trong mỗi 6 dòng liên tiếp cùng nhãn (heartbeat mặc định in
-          #   mỗi 5s -> giữ lại tương đương mỗi ~30s).
-          echo "::group::Pipeline output (bấm để xem chi tiết)"
-          python ci_run_latest_project.py 2>&1 | tr '\r' '\n' | awk '
-            {
-              line = $0
-              if (match(line, /[0-9]+(\.[0-9]+)?%/)) {
-                pct = substr(line, RSTART, RLENGTH - 1) + 0
-                split(line, arr, "[")
-                key = "pct:" arr[1]
-                bucket = int(pct / 5)
-                if (pct < 100 && bucket == last[key]) next
-                last[key] = bucket
-              } else if (line ~ /vẫn đang chạy/) {
-                split(line, arr, "]")
-                key = "hb:" arr[1]
-                cnt[key]++
-                if (cnt[key] % 6 != 1) next
-              }
-              print line
-            }
-          ' | tee pipeline_run.log
-          echo "::endgroup::"
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          CLOUD_ACCESS_KEY: ${{ secrets.CLOUD_ACCESS_KEY }}
+          CLOUD_SECRET_KEY: ${{ secrets.CLOUD_SECRET_KEY }}
+          CLOUD_BUCKET_NAME: ${{ secrets.CLOUD_BUCKET_NAME }}
+          CLOUD_ENDPOINT_URL: ${{ secrets.CLOUD_ENDPOINT_URL }}
+          CLOUD_REGION_NAME: ${{ secrets.CLOUD_REGION_NAME }}
+          CLOUD_ADDRESSING_STYLE: ${{ secrets.CLOUD_ADDRESSING_STYLE }}
+        run: python .github/scripts/render_ci_config.py
 
-      - name: Upload log / output làm artifact (nếu có)
+      - name: Chạy pipeline (project mới nhất chưa xong)
+        run: python ci_run_latest_project.py
+
+      # Máy ảo bị xoá sạch sau khi job kết thúc nên bước này không thật sự
+      # cần thiết để "dọn dẹp", nhưng vẫn xoá config.toml (chứa key thật vừa
+      # render ra) ngay khi xong việc, đề phòng bước debug/artifact phía sau
+      # lỡ đọc nhầm thư mục gốc.
+      - name: Xoá config.toml chứa key thật
         if: always()
+        run: rm -f config.toml
+
+      # Nếu job lỗi giữa chừng, đính kèm log/metadata của project đang xử lý
+      # để dễ chẩn đoán — KHÔNG đính kèm video/audio (quá nặng, và bản đầy đủ
+      # đã có trên cloud rồi nếu sync thành công trước lúc lỗi).
+      - name: Upload log khi lỗi (để debug)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: pipeline-output-${{ github.run_id }}
+          name: ai-director-debug-${{ github.run_id }}
           path: |
-            projects/**/output/deliverables/**
-            projects/**/output/pipeline/*.log
+            projects/**/_project_meta.json
+            projects/**/checkpoints/**/*.json
           if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Trigger job kế tiếp nếu còn project chưa xong
-        # if: always() -> chạy kể cả khi job bị GitHub huỷ do vượt timeout-minutes,
-        # hoặc bước chạy pipeline ở trên lỗi. Nhờ concurrency group phía trên,
-        # job mới sẽ CHỜ job hiện tại kết thúc hẳn rồi mới chạy, không chồng lấn.
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if grep -q "Không có project nào đang chờ xử lý" pipeline_run.log 2>/dev/null; then
-            echo "Không còn project nào đang chờ -> không trigger job kế tiếp."
-          else
-            echo "Còn project chưa xong (hoặc bị cắt ngang do timeout) -> trigger job kế tiếp."
-            # GitHub API thỉnh thoảng trả lỗi 500 tạm thời khi tạo
-            # workflow_dispatch event. Thử lại tối đa 5 lần, cách nhau
-            # theo cấp số nhân (5s, 10s, 20s, 40s, 80s) trước khi bỏ cuộc.
-            attempt=1
-            max_attempts=5
-            until gh workflow run run-pipeline.yml --ref "${{ github.ref_name }}"; do
-              if [ "$attempt" -ge "$max_attempts" ]; then
-                echo "Đã thử $attempt lần vẫn lỗi -> bỏ cuộc. Job schedule (cron hằng ngày) sẽ tự chạy lại sau."
-                exit 1
-              fi
-              wait_seconds=$((5 * 2 ** (attempt - 1)))
-              echo "Lần $attempt thất bại, thử lại sau ${wait_seconds}s..."
-              sleep "$wait_seconds"
-              attempt=$((attempt + 1))
-            done
-            echo "Trigger job kế tiếp thành công."
-          fi
+          retention-days: 3
