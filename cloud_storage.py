@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -173,26 +175,77 @@ class CloudStorage:
             capture_output=True, text=True, timeout=timeout,
         )
 
+    # Nếu rclone không in thêm bất kỳ dòng log nào trong ngần này giây,
+    # chủ động coi là "treo" và kill tiến trình — lưới an toàn Ở TẦNG
+    # PYTHON, độc lập với --timeout (idle timeout) của rclone, phòng hờ
+    # MỌI nguyên nhân treo khác chưa lường hết (không chỉ riêng bug
+    # --progress đã sửa ở trên). An toàn tuyệt đối để làm điều này ở đây:
+    # khác hẳn bug watchdog thời boto3 (phải "bỏ mặc" 1 thread Python kẹt
+    # trong code C của s3transfer vì không kill được), ở đây ta chỉ kill
+    # 1 TIẾN TRÌNH HỆ ĐIỀU HÀNH con do chính ta spawn ra — luôn kill sạch
+    # được, không rò rỉ gì cả.
+    _STREAM_STALL_TIMEOUT_SEC = 900  # 15 phút không có dòng log mới -> coi là treo
+
     def _rclone_stream(self, args: list[str]) -> tuple[int, list[str]]:
         """Chạy 1 lệnh rclone dài (copy project cả GB dữ liệu), IN TRỰC
-        TIẾP tiến độ của rclone ra console (rclone tự có --progress/
-        --stats, không cần code progress bar riêng nữa), đồng thời gom lại
-        các dòng log để đọc số liệu tổng kết ở cuối (xem
-        _RE_TRANSFERRED_COUNT). Không đặt timeout cứng ở đây — để
-        --timeout (idle timeout) của rclone tự lo, vì đây là thao tác có
-        thể chạy rất lâu với dữ liệu lớn."""
+        TIẾP log tiến độ của rclone ra console, đồng thời gom lại các dòng
+        log để đọc số liệu tổng kết ở cuối (xem _RE_TRANSFERRED_COUNT).
+
+        QUAN TRỌNG: KHÔNG dùng --progress ở đây. --progress vẽ 1 khối hiển
+        thị bằng mã điều khiển terminal (\\r để đè dòng tại chỗ, không phải
+        \\n xuống dòng thật) — hợp lý khi chạy trên terminal thật, nhưng
+        khi stdout bị pipe (như subprocess.PIPE ở đây, hoặc khi chạy trên
+        CI/GitHub Actions), rclone vẫn liên tục ghi \\r mà KHÔNG có \\n.
+        for line in proc.stdout ở dưới đợi \\n để tách dòng -> không đọc
+        được gì, trong khi buffer của pipe (thường 64KB) đầy dần rồi ghi
+        bị chặn phía rclone -> CẢ HAI BÊN khoá chờ nhau vô thời hạn (nhìn
+        như "treo", dù transfer thật có thể vẫn đang chạy tốt dưới nền).
+        Đây CHÍNH LÀ nguyên nhân của lần treo 30+ phút đã gặp.
+        Thay vào đó dùng "-v --stats-one-line": rclone in các dòng LOG
+        thống kê định kỳ (mỗi --stats), MỖI dòng luôn kết thúc bằng \\n
+        thật qua framework log thông thường -> an toàn tuyệt đối khi bị
+        pipe/redirect, không có nguy cơ deadlock.
+
+        Ngoài ra còn có lưới an toàn _STREAM_STALL_TIMEOUT_SEC (xem
+        docstring của hằng số đó) để chủ động kill nếu vẫn treo vì lý do
+        khác — đọc dòng qua 1 thread nền + queue để không tự chặn chính
+        vòng lặp đọc bằng timeout được."""
         proc = subprocess.Popen(
-            self._rclone_args(args), env=self._env,
+            self._rclone_args(["-v", "--stats-one-line", *args]), env=self._env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        lines: list[str] = []
         assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            print(f"[cloud] {line}")
-            lines.append(line)
-        returncode = proc.wait()
+
+        q: queue.Queue[str | None] = queue.Queue()
+
+        def _reader():
+            try:
+                for raw_line in proc.stdout:
+                    q.put(raw_line.rstrip("\n"))
+            finally:
+                q.put(None)  # đánh dấu stdout đã đóng (process đã thoát)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        lines: list[str] = []
+        stalled = False
+        while True:
+            try:
+                item = q.get(timeout=self._STREAM_STALL_TIMEOUT_SEC)
+            except queue.Empty:
+                stalled = True
+                print(f"[cloud] CẢNH BÁO: không có tiến triển nào trong "
+                      f"{self._STREAM_STALL_TIMEOUT_SEC}s -> chủ động huỷ lệnh rclone "
+                      f"(coi như thất bại, sẽ không chặn pipeline vô thời hạn).")
+                proc.kill()
+                break
+            if item is None:
+                break
+            print(f"[cloud] {item}")
+            lines.append(item)
+
+        returncode = proc.wait() if not stalled else -9
         return returncode, lines
 
     # ------------------------------------------------------------------
@@ -338,7 +391,6 @@ class CloudStorage:
             "--exclude", "_*.json",
             "--transfers", str(max_workers),
             "--checkers", str(max_workers),
-            "--progress",
             "--stats", "5s",
         ])
         elapsed = time.time() - start
@@ -396,7 +448,6 @@ class CloudStorage:
             "copy", f"{self._remote}/{remote_prefix}", str(local_dir),
             "--transfers", str(max_workers),
             "--checkers", str(max_workers),
-            "--progress",
             "--stats", "5s",
         ])
         elapsed = time.time() - start
