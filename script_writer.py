@@ -129,11 +129,37 @@ def _chat_cerebras(cfg, system_prompt: str, user_prompt: str, max_tokens: int | 
 
 _local_model_singleton: "LocalScriptModel | None" = None
 
+# VRAM còn trống (GB) dưới ngưỡng này -> tự động bật quantization 4-bit thay
+# vì tải full bf16/fp16. Qwen3-4B ở bf16 tốn ~8GB CHỈ để load weights, chưa
+# tính KV cache cho input dài (batch narration có thể ~20K token) -> trên GPU
+# < ~12GB free (Colab T4 dùng chung, laptop GPU, v.v.) rất dễ OOM giữa generate().
+# Ở 4-bit, cùng model chỉ tốn ~2.5-3GB weights, để dư nhiều VRAM hơn cho KV cache.
+_LOW_VRAM_QUANT_THRESHOLD_GB = 12.0
+# Dưới ngưỡng này (kể cả sau khi đã quant 4-bit) coi như không đủ để chạy GPU
+# ổn định cho ngữ cảnh dài -> rơi về CPU thay vì cố chạy rồi OOM giữa chừng.
+_MIN_USABLE_CUDA_VRAM_GB = 3.5
+
+
+class LocalModelOOMError(RuntimeError):
+    """Hết VRAM/RAM khi sinh text bằng model local, kể cả sau khi đã thử giảm
+    max_new_tokens + dọn cache. Caller (vd generate_narration) có thể bắt lỗi
+    này để CHIA NHỎ batch input rồi thử lại, thay vì để cả pipeline crash."""
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or "cuda error" in text or isinstance(exc, MemoryError)
+
 
 class LocalScriptModel:
     """Bọc model + tokenizer chạy local, load một lần và tái sử dụng cho toàn
     bộ hooks + mọi batch narration của 1 project (tránh load lại model nặng
-    cho mỗi lệnh gọi)."""
+    cho mỗi lệnh gọi).
+
+    Tự thích ứng với phần cứng thật đang chạy (thay vì giả định luôn có GPU
+    lớn rảnh VRAM): phát hiện VRAM còn trống lúc load() để tự chọn quantization
+    4-bit khi cần, và tính ra "ngân sách" context token an toàn thay vì dùng
+    1 con số cố định cho mọi máy (xem `recommended_max_context_tokens`)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -141,36 +167,133 @@ class LocalScriptModel:
         self.cache_dir = str(cfg.resolve_path("paths.model_cache_dir"))
         self.device = resolve_torch_device(cfg.get("processing.script_local_device", "auto"))
         self.dtype_name = cfg.get("processing.script_local_dtype", "bfloat16")
+        self.quantization = cfg.get("processing.script_local_quantization", "auto")  # auto|4bit|8bit|none
         self.temperature = cfg.get("processing.script_local_temperature", 0.7)
         self.top_p = cfg.get("processing.script_local_top_p", 0.8)
         self.top_k = cfg.get("processing.script_local_top_k", 20)
         self.model = None
         self.tokenizer = None
         self._torch = None
+        self._quantized = False
+        self._free_vram_gb_at_load: float | None = None
 
     def load(self) -> None:
+        # Giảm phân mảnh VRAM (nguyên nhân phổ biến gây OOM dù tổng VRAM còn
+        # đủ) — phải set TRƯỚC khi CUDA context được khởi tạo (trước import torch).
+        import os
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
         import torch  # lazy import: chỉ cần khi thực sự dùng backend "local"
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self._torch = torch
         dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(
             self.dtype_name, torch.bfloat16
         )
+
+        from platform_utils import get_free_vram_gb
+        free_vram_gb = get_free_vram_gb() if self.device == "cuda" else None
+        self._free_vram_gb_at_load = free_vram_gb
+
+        # Nếu GPU được chọn nhưng gần như không còn VRAM trống -> rơi về CPU
+        # ngay từ đầu thay vì cố tải rồi OOM (vd GPU đang bị stage khác giữ chỗ).
+        if self.device == "cuda" and free_vram_gb is not None and free_vram_gb < _MIN_USABLE_CUDA_VRAM_GB:
+            print(f"[script_writer] CẢNH BÁO: GPU chỉ còn ~{free_vram_gb:.1f}GB VRAM trống "
+                  f"(< {_MIN_USABLE_CUDA_VRAM_GB}GB) — chuyển sang chạy CPU để tránh OOM.")
+            self.device = "cpu"
+
+        want_quant = self.quantization
+        if want_quant == "auto":
+            want_quant = (
+                "4bit" if self.device == "cuda" and free_vram_gb is not None
+                and free_vram_gb < _LOW_VRAM_QUANT_THRESHOLD_GB else "none"
+            )
+
+        quant_config = None
+        if want_quant in ("4bit", "8bit") and self.device == "cuda":
+            try:
+                from transformers import BitsAndBytesConfig
+                if want_quant == "4bit":
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=dtype,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                    )
+                else:
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                self._quantized = True
+            except ImportError:
+                print("[script_writer] CẢNH BÁO: thiếu package 'bitsandbytes' nên không bật được "
+                      f"quantization {want_quant} dù VRAM thấp (~{free_vram_gb and round(free_vram_gb, 1)}GB "
+                      "trống) — cài `pip install bitsandbytes` để giảm VRAM cần thiết. Vẫn tiếp tục "
+                      "chạy full-precision, có thể chậm/OOM trên GPU nhỏ.")
+                want_quant = "none"
+
+        vram_note = f", VRAM trống ~{free_vram_gb:.1f}GB" if free_vram_gb is not None else ""
         print(f"[script_writer] Loading local model {self.model_name} on {self.device} "
-              f"({self.dtype_name})... (lần đầu sẽ tải model; log tải % / tốc độ của "
-              f"huggingface_hub sẽ hiện ngay bên dưới)")
+              f"({self.dtype_name}, quantization={want_quant}{vram_note})... (lần đầu sẽ tải model; "
+              f"log tải % / tốc độ của huggingface_hub sẽ hiện ngay bên dưới)")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name, cache_dir=self.cache_dir, trust_remote_code=True,
         )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
+
+        load_kwargs = dict(
             cache_dir=self.cache_dir,
-            torch_dtype=dtype,
-            device_map=self.device if self.device == "cuda" else None,
             trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
-        if self.device in ("cpu", "mps"):
+        if quant_config is not None:
+            load_kwargs["quantization_config"] = quant_config
+            load_kwargs["device_map"] = "auto"
+        else:
+            load_kwargs["device_map"] = "auto" if self.device == "cuda" else None
+            load_kwargs["dtype"] = dtype
+
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
+        except TypeError:
+            # transformers cũ hơn không nhận kwarg 'dtype' (chỉ có 'torch_dtype').
+            load_kwargs.pop("dtype", None)
+            if quant_config is None:
+                load_kwargs["torch_dtype"] = dtype
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
+        except self._torch.cuda.OutOfMemoryError:
+            # Không đủ VRAM ngay cả để LOAD model (khác với OOM lúc generate).
+            # Thử lần cuối bằng CPU thay vì crash toàn bộ pipeline.
+            print("[script_writer] CẢNH BÁO: OOM khi tải model lên GPU — thử lại trên CPU.")
+            gc.collect()
+            self._torch.cuda.empty_cache()
+            self.device = "cpu"
+            load_kwargs.pop("device_map", None)
+            load_kwargs.pop("quantization_config", None)
+            load_kwargs["dtype"] = dtype
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
+
+        if self.device in ("cpu", "mps") and quant_config is None:
             self.model.to(self.device)
         self.model.eval()
+
+    def recommended_max_context_tokens(self, configured_default: int) -> int:
+        """Ngân sách token INPUT an toàn cho model local, dựa trên VRAM thật
+        phát hiện lúc load() thay vì 1 số cố định — máy yếu tự động dùng batch
+        nhỏ hơn (nhiều batch hơn nhưng không OOM), máy mạnh vẫn tận dụng được
+        context lớn như config yêu cầu."""
+        if self.device != "cuda" or self._free_vram_gb_at_load is None:
+            # CPU/MPS: không có ranh giới VRAM cứng như CUDA, nhưng vẫn giới
+            # hạn hợp lý để tránh generate() quá chậm / cạn RAM hệ thống.
+            return min(configured_default, 12000)
+        free_gb = self._free_vram_gb_at_load
+        # Ước lượng thô: mỗi 1K token input (KV cache, cỡ model 4B) tốn khoảng
+        # 0.35-0.5GB VRAM khi CHƯA quantize, ít hơn khi đã 4-bit. Trừ hao sẵn
+        # phần weights + generate buffer + margin an toàn trước khi chia cho
+        # chi phí/1K token, rồi lấy min với giá trị cấu hình để không vượt
+        # quá cái người dùng chủ động đặt.
+        weights_reserve_gb = 3.0 if self._quantized else 8.5
+        usable_gb = max(0.0, free_gb - weights_reserve_gb - 1.5)  # 1.5GB margin an toàn
+        cost_per_1k_tokens_gb = 0.25 if self._quantized else 0.45
+        est_tokens = int((usable_gb / cost_per_1k_tokens_gb) * 1000)
+        est_tokens = max(1500, est_tokens)  # sàn tối thiểu để vẫn xử lý được scene
+        return max(1500, min(configured_default, est_tokens))
 
     def unload(self) -> None:
         del self.model
@@ -189,7 +312,11 @@ class LocalScriptModel:
         """Sinh text qua chat template. Qwen3-4B-Instruct-2507 (bản "Instruct",
         KHÔNG phải bản "Thinking") không tự chèn suy luận nội bộ vào output
         mặc định, nên không gặp lại lỗi "nuốt hết token vào suy nghĩ" như
-        model reasoning phía Cerebras."""
+        model reasoning phía Cerebras.
+
+        Tự phục hồi khi OOM: dọn cache + thử lại với max_new_tokens nhỏ hơn
+        trước khi bó tay và raise LocalModelOOMError (để caller chia nhỏ input
+        batch rồi thử lại — xem generate_narration)."""
         torch = self._torch
         messages = [
             {"role": "system", "content": system_prompt},
@@ -199,20 +326,49 @@ class LocalScriptModel:
             messages, tokenize=False, add_generation_prompt=True,
         )
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
-        print_progress_bar(0, 1, prefix="[script_writer] local", suffix=f"đang sinh (max {max_new_tokens} token)...")
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=self.top_k,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        print_progress_bar(1, 1, prefix="[script_writer] local", suffix="xong")
-        gen_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-        return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        input_len = inputs["input_ids"].shape[1]
+
+        attempt_tokens = max_new_tokens
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                print_progress_bar(
+                    0, 1, prefix="[script_writer] local",
+                    suffix=f"đang sinh (max {attempt_tokens} token, input {input_len} token)...",
+                )
+                with torch.no_grad():
+                    output_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=attempt_tokens,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        top_k=self.top_k,
+                        do_sample=True,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
+                print_progress_bar(1, 1, prefix="[script_writer] local", suffix="xong")
+                gen_ids = output_ids[0][input_len:]
+                return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            except Exception as e:  # bắt rộng vì OutOfMemoryError có thể là torch.cuda.* hoặc RuntimeError tuỳ version
+                if not _is_oom_error(e):
+                    raise
+                last_err = e
+                gc.collect()
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                if attempt_tokens > 512:
+                    attempt_tokens = max(512, attempt_tokens // 2)
+                    print(f"[script_writer] CẢNH BÁO: OOM lúc generate — dọn cache và thử lại với "
+                          f"max_new_tokens giảm còn {attempt_tokens} (lần {attempt + 1}/3).")
+                    continue
+                break
+        raise LocalModelOOMError(
+            f"Hết VRAM/RAM khi sinh text (input {input_len} token) dù đã giảm max_new_tokens "
+            f"xuống {attempt_tokens} và dọn cache 3 lần liên tiếp: {last_err}"
+        ) from last_err
 
 
 def _get_local_model(cfg) -> "LocalScriptModel":
@@ -499,7 +655,17 @@ def generate_narration(
     # narration mạch lạc hơn vì model thấy nhiều scene liền một lúc.
     backend = cfg.get("api.script_backend", "local")
     if backend == "local":
-        max_context_tokens = cfg.get("processing.script_local_max_context_tokens", 24000)
+        configured_context_tokens = cfg.get("processing.script_local_max_context_tokens", 24000)
+        # Model phải được load TRƯỚC khi hỏi ngân sách token an toàn, vì con
+        # số này phụ thuộc VRAM thật phát hiện lúc load() (xem
+        # LocalScriptModel.recommended_max_context_tokens) — máy yếu tự động
+        # nhận batch nhỏ hơn thay vì luôn dùng con số cố định trong config.toml,
+        # vốn là nguyên nhân gốc của lỗi CUDA OOM khi chạy trên GPU nhỏ.
+        local_model = _get_local_model(cfg)
+        max_context_tokens = local_model.recommended_max_context_tokens(configured_context_tokens)
+        if max_context_tokens < configured_context_tokens:
+            print(f"[script_writer] Giảm ngân sách context từ {configured_context_tokens} xuống "
+                  f"{max_context_tokens} token/batch dựa trên VRAM thực tế của máy này (tránh OOM).")
         batch_output_tokens = cfg.get("processing.script_local_max_new_tokens", 3000)
     else:
         max_context_tokens = cfg.get("api.cerebras_max_context_tokens", 8192)
@@ -531,6 +697,52 @@ def generate_narration(
             print(f"[script_writer] Tìm thấy {len(resume_done)}/{n_batches} batch narration "
                   f"đã có checkpoint — sẽ bỏ qua, chỉ chạy phần còn lại.")
 
+    def _generate_for_blocks(
+        blocks: list[dict[str, Any]], duration: float, is_first: bool, is_last: bool,
+        prior_story_so_far: str, label: str, depth: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Sinh narration cho 1 nhóm block, TỰ CHIA ĐÔI và thử lại nếu backend
+        local báo hết VRAM/RAM (LocalModelOOMError) — cho phép pipeline chạy
+        xong trên phần cứng yếu (thay vì crash) bằng cách xử lý từng phần nhỏ
+        hơn, đổi lấy nhiều lệnh gọi model hơn. Chỉ backend local mới OOM theo
+        kiểu này (cerebras là API từ xa, không tốn VRAM máy mình)."""
+        system_prompt = _narration_system_prompt(narration_language, is_continuation=not is_first)
+        user_prompt = _narration_user_prompt(
+            task_config, hook, director_brief, blocks,
+            duration, prior_story_so_far, is_first=is_first, is_last=is_last,
+        )
+        try:
+            return _chat_json(
+                cfg, system_prompt, user_prompt, stage=f"narration_batch_{label}",
+                max_tokens_override=batch_output_tokens,
+            )
+        except LocalModelOOMError as e:
+            if len(blocks) <= 1 or depth >= 6:
+                raise ScriptWriterJSONError(
+                    f"Stage 'script': hết VRAM/RAM khi sinh narration cho batch '{label}' dù đã "
+                    f"chia nhỏ tới {len(blocks)} scene/lần gọi (depth={depth}). Máy này có thể không "
+                    f"đủ tài nguyên để chạy model local — thử đổi 'api.script_backend = \"cerebras\"' "
+                    f"trong config.toml, hoặc dùng model nhẹ hơn qua "
+                    f"'processing.script_local_model_name'."
+                ) from e
+            mid = len(blocks) // 2
+            print(f"[script_writer] CẢNH BÁO: hết VRAM/RAM ở batch '{label}' ({len(blocks)} scene) — "
+                  f"chia đôi và thử lại (sẽ tốn thêm lệnh gọi model nhưng tránh crash pipeline).")
+            first_half, second_half = blocks[:mid], blocks[mid:]
+            share = mid / len(blocks)
+            first_sentences = _generate_for_blocks(
+                first_half, round(duration * share, 1), is_first, False,
+                prior_story_so_far, f"{label}a", depth + 1,
+            )
+            bridge_story = " ".join(
+                t for t in [s.get("sentence", "") for s in first_sentences[-3:]] if t
+            ) or prior_story_so_far
+            second_sentences = _generate_for_blocks(
+                second_half, round(duration * (1 - share), 1), False, is_last,
+                bridge_story, f"{label}b", depth + 1,
+            )
+            return first_sentences + second_sentences
+
     all_sentences: list[dict[str, Any]] = []
     story_so_far = ""  # vài câu narration cuối, để batch sau nối mạch chuyện
 
@@ -547,14 +759,9 @@ def generate_narration(
         else:
             print(f"[script_writer] Sinh narration batch {batch_idx + 1}/{n_batches} "
                   f"({len(batch_blocks)} scene, ~{batch_target_duration}s)...")
-            system_prompt = _narration_system_prompt(narration_language, is_continuation=not is_first)
-            user_prompt = _narration_user_prompt(
-                task_config, hook, director_brief, batch_blocks,
-                batch_target_duration, story_so_far, is_first=is_first, is_last=is_last,
-            )
-            batch_sentences = _chat_json(
-                cfg, system_prompt, user_prompt, stage=f"narration_batch_{batch_idx + 1}",
-                max_tokens_override=batch_output_tokens,
+            batch_sentences = _generate_for_blocks(
+                batch_blocks, batch_target_duration, is_first, is_last,
+                story_so_far, str(batch_idx + 1),
             )
             if checkpoint_mgr is not None:
                 checkpoint_mgr.save_micro("narration_batch", item_id, batch_sentences)

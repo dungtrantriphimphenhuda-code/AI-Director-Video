@@ -67,6 +67,18 @@ max_concurrency = 40
 script_local_model_name = "Qwen/Qwen3-4B-Instruct-2507"
 script_local_device = "auto"          # auto | cuda | cpu | mps
 script_local_dtype = "bfloat16"       # bfloat16 | float16 | float32
+# Quantization để giảm VRAM cần thiết khi tải model (chỉ áp dụng khi có GPU NVIDIA):
+#   "auto" (MẶC ĐỊNH): tự bật 4-bit khi VRAM còn trống < 12GB lúc load (Colab T4
+#     dùng chung, laptop GPU 6-8GB, v.v.), giữ full-precision nếu VRAM dư dả.
+#   "4bit" | "8bit": ép luôn dùng quantization (cần package `bitsandbytes`).
+#   "none": tắt hẳn, luôn tải full-precision theo script_local_dtype ở trên.
+# Ngoài ra, "ngân sách" context/batch (script_local_max_context_tokens bên dưới)
+# cũng được TỰ ĐỘNG giảm theo VRAM thật phát hiện lúc chạy — con số cấu hình chỉ
+# là TRẦN tối đa, không phải giá trị cố định — và nếu vẫn hết VRAM/RAM giữa lúc
+# sinh narration, pipeline tự chia nhỏ batch rồi thử lại thay vì crash (xem
+# LocalModelOOMError trong script_writer.py). Nhờ 2 lớp bảo vệ này, không cần
+# chỉnh tay theo từng loại phần cứng — script tự thích ứng.
+script_local_quantization = "auto"    # auto | 4bit | 8bit | none
 script_local_temperature = 0.7
 script_local_top_p = 0.8
 script_local_top_k = 20

@@ -228,6 +228,25 @@ def _manual_rclone_instructions() -> str:
     )
 
 
+def get_free_vram_gb() -> float | None:
+    """Trả về VRAM CÒN TRỐNG (GB) của GPU CUDA hiện tại, hoặc None nếu không
+    có CUDA. Dùng để tự động chọn dtype/quantization/context-length phù hợp
+    với phần cứng thật đang chạy (thay vì hard-code cho 1 loại GPU cụ thể),
+    vd Colab free T4 (~15GB) khác rất xa A100 (~40-80GB) hay GPU laptop 6-8GB.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        return free_bytes / (1024 ** 3)
+    except Exception:
+        return None
+
+
 def resolve_torch_device(preferred: str = "auto") -> str:
     """
     Chọn device cho PyTorch: tôn trọng giá trị người dùng chỉ định (cuda/cpu/mps),

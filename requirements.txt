@@ -32,6 +32,13 @@ torch>=2.4.0
 qwen-vl-utils>=0.0.14
 pillow>=10.4.0
 
+# --- Script writer (Qwen3-4B-Instruct-2507, backend "local") ---
+# Cho phép quantization 4-bit/8-bit tự động trên GPU ít VRAM (Colab T4 dùng
+# chung, laptop GPU 6-8GB, v.v.) — xem LocalScriptModel trong script_writer.py.
+# "Mềm": nếu cài lỗi/thiếu (vd không có GPU NVIDIA), script_writer.py tự bỏ
+# qua quantization và chạy full-precision, không crash pipeline.
+bitsandbytes>=0.43.0; sys_platform != "darwin"
+
 # --- Vision (Moondream2, backend "moondream") ---
 einops>=0.7.0
 
