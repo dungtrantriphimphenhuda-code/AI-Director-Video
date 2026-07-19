@@ -55,12 +55,6 @@ jobs:
       - name: Cài thư viện Python
         run: |
           pip install -r requirements.txt
-          # transformers v5.x đổi cách init model nội bộ (yêu cầu post_init()
-          # set all_tied_weights_keys) -> code custom trust_remote_code của
-          # moondream2 (HfMoondream) chưa theo kịp, load model sẽ vỡ với lỗi
-          # "'HfMoondream' object has no attribute 'all_tied_weights_keys'".
-          # Ép lại về nhánh 4.x cho tới khi moondream2/transformers vá lỗi này.
-          pip install "transformers>=4.57.0,<5.0.0"
 
       - name: Kiểm tra config.toml đã có trong repo
         run: |
@@ -137,5 +131,20 @@ jobs:
             echo "Không còn project nào đang chờ -> không trigger job kế tiếp."
           else
             echo "Còn project chưa xong (hoặc bị cắt ngang do timeout) -> trigger job kế tiếp."
-            gh workflow run run-pipeline.yml --ref "${{ github.ref_name }}"
+            # GitHub API thỉnh thoảng trả lỗi 500 tạm thời khi tạo
+            # workflow_dispatch event. Thử lại tối đa 5 lần, cách nhau
+            # theo cấp số nhân (5s, 10s, 20s, 40s, 80s) trước khi bỏ cuộc.
+            attempt=1
+            max_attempts=5
+            until gh workflow run run-pipeline.yml --ref "${{ github.ref_name }}"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Đã thử $attempt lần vẫn lỗi -> bỏ cuộc. Job schedule (cron hằng ngày) sẽ tự chạy lại sau."
+                exit 1
+              fi
+              wait_seconds=$((5 * 2 ** (attempt - 1)))
+              echo "Lần $attempt thất bại, thử lại sau ${wait_seconds}s..."
+              sleep "$wait_seconds"
+              attempt=$((attempt + 1))
+            done
+            echo "Trigger job kế tiếp thành công."
           fi
