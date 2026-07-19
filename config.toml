@@ -10,6 +10,17 @@ cerebras_base_url = "https://api.cerebras.ai/v1"
 cerebras_model = "zai-glm-4.7"
 cerebras_max_tokens = 8000
 cerebras_temperature = 0.8
+# Context window THẬT của model Cerebras đang dùng (input+output cộng lại).
+# Dùng để chia semantic blocks thành nhiều batch nhỏ khi sinh narration cho
+# phim dài (xem BUGFIX trong script_writer.py: trước đây dồn hết 1600+ scene
+# vào 1 request -> lỗi context_length_exceeded). Đổi nếu bạn dùng model có
+# context lớn hơn/nhỏ hơn 8192 token.
+cerebras_max_context_tokens = 8192
+# Số token output tối đa CHO MỖI BATCH narration (khác với cerebras_max_tokens
+# ở trên, vốn dùng cho các lệnh gọi 1-shot khác như generate_hooks). Để nhỏ
+# vì mỗi batch chỉ cần vài chục câu, dành phần lớn ngân sách token cho input
+# (scene blocks).
+cerebras_narration_batch_max_tokens = 2000
 
 # Hugging Face token (for Qwen3-VL-4B-Instruct or other models)
 hf_token = ""

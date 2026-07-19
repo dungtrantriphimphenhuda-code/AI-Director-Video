@@ -38,11 +38,18 @@ def _get_client(cfg) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
-def _chat(cfg, system_prompt: str, user_prompt: str) -> str:
-    """Gọi Cerebras Gemma 4 31B (chat completions, OpenAI-compatible)."""
+def _chat(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
+    """Gọi Cerebras (chat completions, OpenAI-compatible).
+
+    max_tokens: nếu None, dùng api.cerebras_max_tokens trong config (hành vi cũ).
+    Cho phép override theo từng call vì narration được sinh theo batch nhỏ
+    (xem generate_narration) — mỗi batch chỉ cần vài trăm token thay vì
+    toàn bộ cerebras_max_tokens, để dành ngân sách token cho input.
+    """
     client = _get_client(cfg)
     model = cfg.get("api.cerebras_model", "gemma-4-31b")
-    max_tokens = cfg.get("api.cerebras_max_tokens", 8000)
+    if max_tokens is None:
+        max_tokens = cfg.get("api.cerebras_max_tokens", 8000)
     temperature = cfg.get("api.cerebras_temperature", 0.8)
 
     # Một API call không có log tải sẵn theo %, nên dùng streaming: mỗi chunk
@@ -98,7 +105,10 @@ def _extract_json(text: str) -> Any:
         raise
 
 
-def _chat_json(cfg, system_prompt: str, user_prompt: str, *, stage: str, max_retries: int = 1) -> Any:
+def _chat_json(
+    cfg, system_prompt: str, user_prompt: str, *, stage: str, max_retries: int = 1,
+    max_tokens_override: int | None = None,
+) -> Any:
     """Gọi `_chat()` rồi parse JSON qua `_extract_json()`, có retry khi JSON hỏng/bị cắt
     (vd: output chạm `cerebras_max_tokens` giữa chừng). Nếu vẫn lỗi sau khi retry,
     raise `ScriptWriterJSONError` rõ ràng thay vì để `json.JSONDecodeError` thô lọt
@@ -113,7 +123,7 @@ def _chat_json(cfg, system_prompt: str, user_prompt: str, *, stage: str, max_ret
                 "cắt giữa chừng hoặc lẫn text thừa). Lần này trả lời NGẮN GỌN HƠN nếu "
                 "cần và CHỈ trả về đúng 1 JSON hợp lệ, không thêm bất kỳ text nào khác."
             )
-        raw = _chat(cfg, system_prompt, prompt)
+        raw = _chat(cfg, system_prompt, prompt, max_tokens=max_tokens_override)
         try:
             return _extract_json(raw)
         except json.JSONDecodeError as e:
@@ -157,42 +167,54 @@ def generate_hooks(cfg, task_config: dict[str, Any], director_brief: str = "") -
     return _chat_json(cfg, system_prompt, user_prompt, stage="hooks")
 
 
-def generate_narration(
-    cfg,
-    semantic_blocks: list[dict[str, Any]],
-    task_config: dict[str, Any],
-    hook: str | None = None,
-    director_brief: str = "",
-) -> list[dict[str, Any]]:
+def _estimate_tokens(text: str) -> int:
+    """Ước lượng SỐ TOKEN của 1 chuỗi (chars // 3).
+
+    Đây là ước lượng CỐ Ý cao hơn thực tế (an toàn) để chia batch — không
+    dùng cho mục đích tính tiền/giới hạn chính xác của API, chỉ để quyết
+    định lúc nào cần cắt batch trước khi gọi Cerebras.
     """
-    Hàm chính: sinh lời bình (narration) gắn với scene_ids nguồn.
+    return max(1, len(text) // 3)
 
-    Input:
-        semantic_blocks: output của semantic_graph.build_semantic_blocks
-        task_config: dict {content_type, genre, narration_pov, target_duration_sec, title, ...}
-        hook: câu hook đã được chọn (nếu có)
-        director_brief: tóm tắt cốt truyện tra cứu được (nếu có)
 
-    Output: list[{"sentence_id", "sentence", "scene_ids": [...], "match_reason", "match_score"}]
-    LLM chỉ được chọn scene_ids có trong semantic_blocks — không tự bịa timestamp.
+def _batch_semantic_blocks(
+    compact_blocks: list[dict[str, Any]],
+    max_input_tokens: int,
+) -> list[list[dict[str, Any]]]:
+    """Chia compact_blocks thành nhiều batch sao cho JSON của mỗi batch nằm
+    trong ngân sách token cho phép.
+
+    BUGFIX GỐC: trước đây TOÀN BỘ compact_blocks (có thể 1000+ scene với
+    phim dài, vd 1609 scene ~ 158.505 ký tự) bị dồn vào 1 request Cerebras
+    duy nhất, vượt xa context window thật của model (8192 token) ->
+    `openai.BadRequestError: context_length_exceeded`. Giờ chia nhỏ thành
+    nhiều batch, mỗi batch được ước lượng để lọt vừa ngân sách token.
     """
-    # Rút gọn semantic_blocks để tiết kiệm token: bỏ dialogue thô dài, giữ tóm tắt.
-    compact_blocks = [
-        {
-            "scene_id": b["scene_id"],
-            "start": b["start"],
-            "end": b["end"],
-            "visual_summary": b["visual_summary"],
-            "dialogue_snippets": [d["text"] for d in b["dialogues"][:3]],
-            "characters": b["characters"],
-            "emotion": b["emotion"],
-            "tags": b["tags"],
-        }
-        for b in semantic_blocks
-    ]
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_tokens = 0
+    for block in compact_blocks:
+        block_tokens = _estimate_tokens(json.dumps(block, ensure_ascii=False))
+        if current and current_tokens + block_tokens > max_input_tokens:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(block)
+        current_tokens += block_tokens
+    if current:
+        batches.append(current)
+    return batches
 
-    narration_language = task_config.get("narration_language", "Vietnamese")
-    system_prompt = (
+
+def _narration_system_prompt(narration_language: str, is_continuation: bool) -> str:
+    continuation_rule = (
+        "7. Đây là phần TIẾP THEO của một narration dài hơn đã được sinh trước đó theo "
+        "batch (do phim quá dài để đưa hết vào 1 request). Bạn được cho xem vài câu cuối "
+        "của phần trước (mục 'story_so_far') CHỈ để giữ mạch văn/giọng kể liền mạch — "
+        "TUYỆT ĐỐI không lặp lại các câu đó, không viết lại phần mở đầu/hook nữa.\n"
+        if is_continuation else ""
+    )
+    return (
         "You are the story director for a viral movie/drama commentary video. "
         "You receive a list of semantic scene blocks (each with a scene_id, time range, "
         "visual summary, dialogue snippets, characters, emotion, tags) extracted from the "
@@ -213,28 +235,167 @@ def generate_narration(
         "5. Escalate stakes each beat; end with an emotional release in the last sentences.\n"
         "6. If no scene fits a beat well, still pick the closest scene and lower match_score, "
         "do not fabricate one.\n"
+        f"{continuation_rule}"
         "Respond ONLY with a JSON array of objects with keys: "
         "sentence_id (string, e.g. 'sent_001'), sentence (string), scene_ids (array of strings), "
         "match_reason (string, explain WHY this scene serves the narrative beat), "
         "match_score (number 0-1)."
     )
 
-    user_prompt = (
-        f"Task config: {json.dumps(task_config, ensure_ascii=False)}\n"
-        f"Selected opening hook: {hook or '(none selected, choose a strong opening yourself)'}\n"
-        f"Director's brief (plot research, may be empty): {director_brief or '(none)'}\n\n"
-        f"Semantic scene blocks (only source of truth for scene_ids/timestamps):\n"
-        f"{json.dumps(compact_blocks, ensure_ascii=False)}\n\n"
-        f"Target narration duration: ~{task_config.get('target_duration_sec', 180)} seconds.\n"
-        "Write the full narration now as the JSON array described in the system prompt."
-    )
 
-    sentences = _chat_json(cfg, system_prompt, user_prompt, stage="narration")
+def _narration_user_prompt(
+    task_config: dict[str, Any],
+    hook: str | None,
+    director_brief: str,
+    batch_blocks: list[dict[str, Any]],
+    batch_target_duration: float,
+    story_so_far: str,
+    *,
+    is_first: bool,
+    is_last: bool,
+) -> str:
+    parts = [f"Task config: {json.dumps(task_config, ensure_ascii=False)}"]
+    if is_first:
+        parts.append(f"Selected opening hook: {hook or '(none selected, choose a strong opening yourself)'}")
+        parts.append(f"Director's brief (plot research, may be empty): {director_brief or '(none)'}")
+    else:
+        parts.append(
+            f"story_so_far (last sentences of the previous batch, for continuity ONLY — "
+            f"do not repeat): {story_so_far or '(none)'}"
+        )
+    parts.append(
+        "Semantic scene blocks (only source of truth for scene_ids/timestamps) — this is "
+        f"a SEGMENT of the full film, not the whole thing:\n"
+        f"{json.dumps(batch_blocks, ensure_ascii=False)}"
+    )
+    parts.append(f"Target narration duration for THIS segment: ~{batch_target_duration} seconds.")
+    if not is_last:
+        parts.append("This is NOT the final segment — do not wrap up the story or add a closing line yet.")
+    else:
+        parts.append("This IS the final segment — bring the narration to a satisfying emotional close.")
+    parts.append("Write the narration for this segment now as the JSON array described in the system prompt.")
+    return "\n\n".join(parts)
+
+
+def generate_narration(
+    cfg,
+    semantic_blocks: list[dict[str, Any]],
+    task_config: dict[str, Any],
+    hook: str | None = None,
+    director_brief: str = "",
+    checkpoint_mgr=None,
+) -> list[dict[str, Any]]:
+    """
+    Hàm chính: sinh lời bình (narration) gắn với scene_ids nguồn.
+
+    Input:
+        semantic_blocks: output của semantic_graph.build_semantic_blocks
+        task_config: dict {content_type, genre, narration_pov, target_duration_sec, title, ...}
+        hook: câu hook đã được chọn (nếu có)
+        director_brief: tóm tắt cốt truyện tra cứu được (nếu có)
+        checkpoint_mgr: nếu có, mỗi batch narration được lưu micro-checkpoint
+            ("narration_batch") để resume được nếu Colab bị ngắt giữa chừng
+            (phim dài có thể cần hàng chục batch, mỗi batch tốn 1 API call).
+
+    Output: list[{"sentence_id", "sentence", "scene_ids": [...], "match_reason", "match_score"}]
+    LLM chỉ được chọn scene_ids có trong semantic_blocks — không tự bịa timestamp.
+
+    Phim dài (nhiều scene) được chia thành nhiều batch nhỏ để mỗi request gửi
+    lên Cerebras luôn nằm trong context window của model (xem
+    _batch_semantic_blocks) — trước đây toàn bộ scene bị dồn vào 1 request,
+    gây lỗi 'context_length_exceeded' với phim có hàng nghìn scene.
+    """
+    # Rút gọn semantic_blocks để tiết kiệm token: bỏ dialogue thô dài, giữ tóm tắt.
+    compact_blocks = [
+        {
+            "scene_id": b["scene_id"],
+            "start": b["start"],
+            "end": b["end"],
+            "visual_summary": b["visual_summary"],
+            "dialogue_snippets": [d["text"] for d in b["dialogues"][:3]],
+            "characters": b["characters"],
+            "emotion": b["emotion"],
+            "tags": b["tags"],
+        }
+        for b in semantic_blocks
+    ]
+
+    narration_language = task_config.get("narration_language", "Vietnamese")
+
+    # ---- Ngân sách token cho phần scene blocks trong mỗi batch ----
+    max_context_tokens = cfg.get("api.cerebras_max_context_tokens", 8192)
+    batch_output_tokens = cfg.get("api.cerebras_narration_batch_max_tokens", 2000)
+    base_system_prompt = _narration_system_prompt(narration_language, is_continuation=False)
+    fixed_overhead_tokens = (
+        _estimate_tokens(base_system_prompt)
+        + _estimate_tokens(json.dumps(task_config, ensure_ascii=False))
+        + _estimate_tokens(hook or "")
+        + _estimate_tokens(director_brief or "")
+        + 300  # margin an toàn cho phần khung câu chữ + story_so_far
+    )
+    max_input_tokens = max(500, max_context_tokens - batch_output_tokens - fixed_overhead_tokens)
+
+    batches = _batch_semantic_blocks(compact_blocks, max_input_tokens)
+    n_batches = len(batches)
+    total_scenes = len(compact_blocks) or 1
+    target_total_duration = task_config.get("target_duration_sec", 180)
+
+    if n_batches > 1:
+        print(f"[script_writer] {total_scenes} scene -> chia thành {n_batches} batch narration "
+              f"(mỗi batch ~{max_input_tokens} token input) để không vượt context window.")
+
+    resume_done: dict[str, Any] = {}
+    if checkpoint_mgr is not None:
+        for item_id in checkpoint_mgr.list_micro_done("narration_batch"):
+            resume_done[item_id] = checkpoint_mgr.load_micro("narration_batch", item_id)
+        if resume_done:
+            print(f"[script_writer] Tìm thấy {len(resume_done)}/{n_batches} batch narration "
+                  f"đã có checkpoint — sẽ bỏ qua, chỉ chạy phần còn lại.")
+
+    all_sentences: list[dict[str, Any]] = []
+    story_so_far = ""  # vài câu narration cuối, để batch sau nối mạch chuyện
+
+    for batch_idx, batch_blocks in enumerate(batches):
+        item_id = f"{batch_idx:04d}"
+        batch_share = len(batch_blocks) / total_scenes
+        batch_target_duration = round(target_total_duration * batch_share, 1)
+        is_first = batch_idx == 0
+        is_last = batch_idx == n_batches - 1
+
+        if item_id in resume_done:
+            print(f"[script_writer] Batch narration {batch_idx + 1}/{n_batches}: đã có checkpoint, bỏ qua.")
+            batch_sentences = resume_done[item_id]
+        else:
+            print(f"[script_writer] Sinh narration batch {batch_idx + 1}/{n_batches} "
+                  f"({len(batch_blocks)} scene, ~{batch_target_duration}s)...")
+            system_prompt = _narration_system_prompt(narration_language, is_continuation=not is_first)
+            user_prompt = _narration_user_prompt(
+                task_config, hook, director_brief, batch_blocks,
+                batch_target_duration, story_so_far, is_first=is_first, is_last=is_last,
+            )
+            batch_sentences = _chat_json(
+                cfg, system_prompt, user_prompt, stage=f"narration_batch_{batch_idx + 1}",
+                max_tokens_override=batch_output_tokens,
+            )
+            if checkpoint_mgr is not None:
+                checkpoint_mgr.save_micro("narration_batch", item_id, batch_sentences)
+
+        all_sentences.extend(batch_sentences)
+        last_texts = [s.get("sentence", "") for s in batch_sentences[-3:]]
+        story_so_far = " ".join(t for t in last_texts if t)
+
+    if checkpoint_mgr is not None and n_batches > 0:
+        checkpoint_mgr.force_sync_micro("narration_batch", f"{n_batches - 1:04d}")
+
+    # Đánh lại sentence_id tuần tự toàn cục — mỗi batch tự đánh số riêng lẻ
+    # (vd cả 2 batch đều có thể trả về "sent_001") nên phải renumber sau khi nối.
+    for i, s in enumerate(all_sentences):
+        s["sentence_id"] = f"sent_{i + 1:03d}"
 
     # Lọc bỏ mọi scene_id không tồn tại thật trong semantic_blocks (an toàn chống LLM bịa).
     valid_scene_ids = {b["scene_id"] for b in semantic_blocks}
     cleaned = []
-    for s in sentences:
+    for s in all_sentences:
         scene_ids = [sid for sid in s.get("scene_ids", []) if sid in valid_scene_ids]
         if not scene_ids:
             # Không còn scene_id hợp lệ nào -> đánh dấu review, bỏ qua khi build storyboard.
@@ -432,8 +593,10 @@ def run_script_writer(
     pipeline_dir = output_dir / "pipeline"
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[script_writer] Generating narration via Cerebras Gemma 4 31B...")
-    narration_sentences = generate_narration(cfg, semantic_blocks, task_config, hook, director_brief)
+    print("[script_writer] Generating narration via Cerebras...")
+    narration_sentences = generate_narration(
+        cfg, semantic_blocks, task_config, hook, director_brief, checkpoint_mgr=checkpoint_mgr,
+    )
 
     print(f"[script_writer] {len(narration_sentences)} câu narration được sinh. Building storyboard...")
     storyboard = build_storyboard(cfg, task_config, narration_sentences, semantic_blocks)
