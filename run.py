@@ -80,6 +80,39 @@ def ensure_python_packages(cfg=None) -> None:
     else:
         print("[deps] Tất cả package đã sẵn sàng.")
 
+    # BUGFIX: vòng lặp ở trên chỉ kiểm tra "import được hay không" -> nếu
+    # transformers ĐÃ được cài sẵn (vd Colab cache từ phiên trước) nhưng là
+    # bản >=5.0.0, nó vẫn coi là "đã sẵn sàng" và KHÔNG cài lại, dù
+    # requirements.txt đã ghim "<5.0.0". transformers v5.x đổi cách
+    # PreTrainedModel khởi tạo nội bộ (cần post_init() set
+    # all_tied_weights_keys) -> code custom trust_remote_code của moondream2
+    # (HfMoondream) chưa theo kịp, vỡ với "'HfMoondream' object has no
+    # attribute 'all_tied_weights_keys'" ngay khi load model (xem vision.py:
+    # MoondreamVisionAnalyzer). Kiểm tra version RIÊNG ở đây và tự hạ nếu cần,
+    # để không phải nhớ chạy tay "pip install --upgrade" mỗi lần môi trường
+    # có sẵn transformers quá mới.
+    try:
+        import transformers
+        from packaging.version import Version
+        current = Version(transformers.__version__)
+        if current >= Version("5.0.0"):
+            print(f"[deps] transformers=={transformers.__version__} (>=5.0.0) không tương thích "
+                  f"với backend vision \"moondream\" (xem vision.py) -> đang hạ về bản 4.x...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "transformers<5.0.0", "--upgrade"],
+                check=True,
+            )
+            print("[deps] Đã hạ transformers về bản 4.x. "
+                  "CẦN KHỞI ĐỘNG LẠI runtime/kernel để bản mới có hiệu lực "
+                  "(module transformers đã import vào bộ nhớ tiến trình hiện tại, "
+                  "cài lại qua pip không tự áp dụng cho tiến trình đang chạy).")
+    except ImportError:
+        pass  # transformers hoặc packaging chưa có sẵn -> vòng cài ở trên sẽ lo phần transformers.
+    except Exception as e:
+        print(f"[deps] CẢNH BÁO: không kiểm tra/hạ được version transformers tự động ({e}). "
+              f"Nếu backend vision \"moondream\" báo lỗi 'all_tied_weights_keys', hãy chạy tay: "
+              f"pip install \"transformers<5.0.0\" --upgrade rồi khởi động lại runtime.")
+
 
 def ask_task_config(cfg, project_reference_urls: list[str] | None = None) -> dict:
     """Thu thập cấu hình nội dung từ người dùng.

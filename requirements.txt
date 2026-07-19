@@ -17,7 +17,16 @@ opencv-python>=4.13.0
 ffmpeg-python>=0.2.0
 
 # --- Vision (Qwen3-VL-4B-Instruct, backend "local") ---
-transformers>=4.57.0
+# transformers v5.x đổi cách init model nội bộ (yêu cầu post_init() set
+# all_tied_weights_keys) -> code custom trust_remote_code của moondream2
+# (HfMoondream) chưa theo kịp, load model sẽ vỡ với lỗi "'HfMoondream'
+# object has no attribute 'all_tied_weights_keys'". CHẶN <5.0.0. vision.py
+# cũng có 1 monkeypatch phòng hờ cho trường hợp môi trường (vd. Colab cache
+# cũ) đã lỡ cài sẵn transformers>=5.0 từ trước — nhưng cách sửa TRIỆT ĐỂ
+# vẫn là chạy lại "pip install -r requirements.txt --upgrade" để hạ đúng
+# version, vì ensure_python_packages() trong run.py chỉ cài package còn
+# THIẾU, không tự hạ version 1 package đã có sẵn.
+transformers>=4.57.0,<5.0.0
 accelerate>=1.2.0
 torch>=2.4.0
 qwen-vl-utils>=0.0.14

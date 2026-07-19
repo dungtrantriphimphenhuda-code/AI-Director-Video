@@ -488,6 +488,34 @@ class MistralVisionAnalyzer:
 # vì API gốc của Moondream2 (encode_image + answer_question) chỉ nhận 1 ảnh/
 # câu hỏi — nên implement analyze_scene() đơn lẻ (không có analyze_batch),
 # và chỉ đọc 1 keyframe đại diện/scene (frame ở giữa danh sách keyframes).
+# QUAN TRỌNG — transformers v5.x đổi cách PreTrainedModel khởi tạo nội bộ:
+# nó cần self.all_tied_weights_keys được set trong post_init(). Code custom
+# (trust_remote_code=True) của Moondream2 (class HfMoondream) chưa cập nhật
+# theo API mới này, nên AutoModelForCausalLM.from_pretrained(...) sẽ vỡ với:
+#   AttributeError: 'HfMoondream' object has no attribute
+#   'all_tied_weights_keys'. Did you mean: '_tied_weights_keys'?
+# Cách sửa CHÍNH là ghim transformers<5.0.0 (xem requirements.txt) — NHƯNG
+# ensure_python_packages() trong run.py chỉ cài package còn THIẾU, không tự
+# hạ version 1 package ĐÃ importable sẵn (vd Colab đã cache transformers>=5.0
+# từ trước) -> pin trong requirements.txt sẽ KHÔNG có tác dụng trừ khi chạy
+# tay "pip install -r requirements.txt --upgrade". Patch dưới đây là lưới an
+# toàn PHỤ, hoạt động bất kể version transformers đang cài là gì: chặn đúng
+# 1 attribute bị thiếu, không đổi hành vi nào khác của model/torch.
+def _patch_transformers_v5_tied_weights_compat() -> None:
+    import torch
+    if getattr(torch.nn.Module, "_moondream_v5_patch_applied", False):
+        return
+    _orig_getattr = torch.nn.Module.__getattr__
+
+    def _patched_getattr(self, name):
+        if name == "all_tied_weights_keys":
+            return {}
+        return _orig_getattr(self, name)
+
+    torch.nn.Module.__getattr__ = _patched_getattr
+    torch.nn.Module._moondream_v5_patch_applied = True
+
+
 class MoondreamVisionAnalyzer:
     """Bọc model Moondream2, load một lần và tái sử dụng cho toàn bộ scene."""
 
@@ -506,6 +534,7 @@ class MoondreamVisionAnalyzer:
         import torch  # lazy import: chỉ cần khi thực sự dùng backend "moondream"
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self._torch = torch
+        _patch_transformers_v5_tied_weights_compat()
 
         print(f"[vision] Loading {self.model_name} (rev={self.revision or 'main'}) "
               f"on {self.device} (backend=moondream, 1 keyframe/scene)... "
