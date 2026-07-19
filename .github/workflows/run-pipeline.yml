@@ -52,6 +52,9 @@ jobs:
       - name: Cài FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg gettext-base
 
+      - name: Cài rclone (cần cho cloud_storage.py, không phải gói pip)
+        run: curl https://rclone.org/install.sh | sudo bash
+
       - name: Cài thư viện Python
         run: |
           pip install -r requirements.txt
