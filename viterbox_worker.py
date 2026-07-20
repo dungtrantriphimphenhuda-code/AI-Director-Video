@@ -54,13 +54,40 @@ def main() -> int:
     with open(sys.argv[1], "r", encoding="utf-8") as f:
         job = json.load(f)
 
+    device = job.get("device", "cpu")
+
+    # Checkpoint gốc (s3gen.pt) của package `viterbox` được lưu sẵn cho CUDA.
+    # Trên máy KHÔNG có GPU (CPU-only — ví dụ GitHub Actions runner miễn phí,
+    # hoặc laptop không có card NVIDIA), `torch.load()` mặc định trong code
+    # gốc của viterbox không truyền map_location -> PyTorch cố nạp thẳng lên
+    # CUDA và crash với lỗi "Attempting to deserialize object on a CUDA
+    # device but torch.cuda.is_available() is False", bất kể chạy ở đâu.
+    # Ta không sửa trực tiếp package viterbox (vì nó bị cài lại từ đầu mỗi
+    # lần), mà "monkeypatch" torch.load ngay tại đây để luôn ép về CPU khi
+    # không có GPU khả dụng, trước khi import/gọi tới viterbox.
+    try:
+        import torch
+    except ImportError as e:
+        print(f"VITERBOX_ERR - Chưa cài 'torch' trong venv này: {e}", flush=True)
+        return 1
+
+    if device == "cpu" or not torch.cuda.is_available():
+        _orig_torch_load = torch.load
+
+        def _torch_load_force_cpu(*args, **kwargs):
+            kwargs.setdefault("map_location", torch.device("cpu"))
+            return _orig_torch_load(*args, **kwargs)
+
+        torch.load = _torch_load_force_cpu
+        print("[viterbox-worker] Không có GPU khả dụng -> ép torch.load map về CPU.",
+              file=sys.stderr, flush=True)
+
     try:
         from viterbox import Viterbox
     except ImportError as e:
         print(f"VITERBOX_ERR - Chưa cài package 'viterbox' trong venv này: {e}", flush=True)
         return 1
 
-    device = job.get("device", "cpu")
     print(f"[viterbox-worker] Đang load model Viterbox (device={device})...",
           file=sys.stderr, flush=True)
     tts = Viterbox.from_pretrained(device)
