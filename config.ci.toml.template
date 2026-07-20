@@ -11,6 +11,18 @@
 # =============================================================================
 
 [api]
+# GitHub Actions runner miễn phí chỉ đảm bảo ~14GB disk trống (kể cả sau khi
+# nâng lên 4vCPU/16GB RAM cuối 2023) -> "local" (tải Qwen3-4B-Instruct về
+# chạy ngay trên máy, ~8GB) rất dễ làm hết disk/RAM giữa chừng, khiến job bị
+# runner kill và GitHub hiện "The operation was canceled". Dùng thẳng
+# Cerebras API (đã có secret CEREBRAS_API_KEY) thay vì tải model về.
+# LƯU Ý: config.py (_apply_ci_safe_overrides) đã TỰ ĐỘNG ép giá trị này về
+# "cerebras" khi phát hiện chạy trong GitHub Actions (biến GITHUB_ACTIONS),
+# kể cả khi file config.toml thật sự dùng lại là bản full có "local" (như
+# khi bạn commit thẳng config.toml vào repo) — dòng dưới đây chỉ để rõ ý
+# định, không phải chỗ duy nhất chặn vấn đề này.
+script_backend = "cerebras"
+
 cerebras_api_key = "${CEREBRAS_API_KEY}"
 cerebras_base_url = "https://api.cerebras.ai/v1"
 cerebras_model = "zai-glm-4.7"
@@ -50,15 +62,14 @@ asr_compute_type = "int8"   # int8 nhanh hơn trên CPU so với float16
 asr_language = "vi"
 
 # ---- Vision ----
-# Theo yêu cầu: giữ vision chạy LOCAL trên CI (giống máy cá nhân), không
-# dùng API. "moondream" (Moondream2, ~1.9B) là lựa chọn hợp lý nhất cho
-# trường hợp này vì model được thiết kế tối ưu cho CPU/edge — nhẹ hơn nhiều
-# so với "local" (Qwen3-VL-4B-Instruct, vốn giả định có GPU). Vẫn sẽ chậm
-# hơn đáng kể so với chạy trên máy có GPU, và với video dài có rủi ro không
-# kịp trong 6 giờ/job — nếu gặp treo/timeout thường xuyên, đổi lại
-# vision_backend = "mistral" (cần thêm secret MISTRAL_API_KEY) sẽ nhanh và
-# ổn định hơn nhiều.
-vision_backend = "moondream"
+# Đổi từ "moondream" sang "mistral": dù Moondream2 (~1.9B) nhẹ hơn nhiều so
+# với Qwen3-VL-4B, việc tải + load thêm 1 model nữa vẫn cộng dồn vào disk
+# (~14GB đảm bảo trên runner miễn phí) và RAM cùng lúc với script_backend —
+# rủi ro "The operation was canceled" giữa chừng. Dùng thẳng Mistral API
+# (đã có secret MISTRAL_API_KEY) để CI không tải bất kỳ model vision nào về
+# máy — nhanh và ổn định hơn nhiều. config.py cũng tự động ép về "mistral"
+# nếu file config.toml thật sự dùng lại đặt "moondream" hoặc "local".
+vision_backend = "mistral"
 vision_device = "cpu"
 vision_dtype = "float32"
 vision_max_new_tokens = 512

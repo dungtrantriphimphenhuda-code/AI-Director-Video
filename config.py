@@ -77,6 +77,101 @@ class Config:
         return self._data
 
 
+def _is_running_in_github_actions() -> bool:
+    """
+    True khi và chỉ khi đang chạy trong 1 job của GitHub Actions.
+
+    GitHub tự set biến môi trường GITHUB_ACTIONS="true" cho MỌI job, không
+    cần workflow khai báo gì thêm. Biến này KHÔNG tồn tại trên máy cá nhân,
+    Colab, hay VPS Linux tự chạy tay/cron — nên dùng nó làm điều kiện là an
+    toàn 100%: override bên dưới chỉ có tác dụng trên GitHub Actions, không
+    bao giờ vô tình kích hoạt ở nơi khác.
+    """
+    return os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
+
+# Runner miễn phí của GitHub Actions (kể cả sau khi nâng lên 4 vCPU/16GB RAM
+# cuối 2023) vẫn CHỈ đảm bảo ~14GB disk trống (GitHub xác nhận chính thức:
+# https://github.com/actions/runner-images/discussions/9329). Các backend
+# "local" (tải model AI về chạy ngay trên máy) dễ dàng vượt quá con số này
+# khi cộng dồn: Qwen3-4B-Instruct-2507 (~8GB), Qwen3-VL-4B (~8GB),
+# funasr (paraformer-zh + fsmn-vad + ct-punc, vài GB), moondream2 (~4GB) —
+# đó là lý do job hay bị "The operation was canceled" ngay sau đoạn
+# tải+load model: hết dung lượng đĩa (hoặc RAM) khiến runner bị kill giữa
+# chừng, không phải ai đó bấm huỷ workflow.
+#
+# fallback_key: tên key trong [api] mà backend nhẹ thay thế cần có giá trị
+# không rỗng thì mới an toàn để tự động chuyển sang (nếu không có, coi như
+# secret đó chưa được cấu hình trên repo -> KHÔNG override, để nguyên giá
+# trị người dùng chọn và chỉ in cảnh báo, tránh đổi sang 1 backend chắc
+# chắn sẽ lỗi vì thiếu key).
+_CI_LIGHTWEIGHT_OVERRIDES = [
+    # (dotted_key gốc, {giá trị "nặng" -> (giá trị nhẹ thay thế, dotted_key api-key cần có)})
+    ("api.script_backend", {
+        "local": ("cerebras", "api.cerebras_api_key"),
+    }),
+    ("processing.vision_backend", {
+        "local": ("mistral", "api.mistral_api_key"),
+        "moondream": ("mistral", "api.mistral_api_key"),
+    }),
+    ("processing.asr_backend", {
+        # funasr tự tải riêng 3 model (ASR + VAD + dấu câu) -> luôn ép về
+        # faster-whisper trên CI, không cần api-key nào nên fallback_key
+        # để None (luôn coi là an toàn để override).
+        "funasr": ("whisper", None),
+    }),
+]
+
+
+def _apply_ci_safe_overrides(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Nếu đang chạy trong GitHub Actions, tự động thay các backend "local"
+    (tải + chạy model AI ngay trên máy, tốn nhiều disk/RAM) bằng backend
+    API tương đương, miễn là secret cần thiết đã có sẵn trong config đã
+    render. Không đụng gì tới config nếu KHÔNG chạy trong GitHub Actions —
+    chạy trên máy thật/Colab/VPS Linux tự quản lý vẫn dùng đúng backend
+    người dùng đã chọn trong config.toml, không thay đổi hành vi.
+    """
+    if not _is_running_in_github_actions():
+        return data
+
+    def _get(dotted: str) -> Any:
+        node: Any = data
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        return node
+
+    def _set(dotted: str, value: Any) -> None:
+        parts = dotted.split(".")
+        node = data
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+
+    for dotted_key, mapping in _CI_LIGHTWEIGHT_OVERRIDES:
+        current = _get(dotted_key)
+        if current not in mapping:
+            continue
+        replacement, required_key = mapping[current]
+        if required_key is not None and not _get(required_key):
+            print(
+                f"[ci-config] CẢNH BÁO: '{dotted_key} = \"{current}\"' rất nặng "
+                f"cho GitHub Actions runner (dễ hết disk/RAM -> job bị huỷ giữa "
+                f"chừng), nhưng thiếu '{required_key}' nên KHÔNG thể tự chuyển "
+                f"sang '{replacement}'. Thêm secret tương ứng nếu muốn CI chạy "
+                f"nhẹ và ổn định hơn."
+            )
+            continue
+        _set(dotted_key, replacement)
+        print(f"[ci-config] Phát hiện chạy trong GitHub Actions: tự đổi "
+              f"'{dotted_key}' từ \"{current}\" sang \"{replacement}\" để tránh "
+              f"hết disk/RAM khi tải model local (không ảnh hưởng máy thật/Colab).")
+
+    return data
+
+
 def load_config(path: str | os.PathLike = "config.toml") -> Config:
     """
     Load và parse config.toml. Ném lỗi rõ ràng nếu file không tồn tại
@@ -99,6 +194,8 @@ def load_config(path: str | os.PathLike = "config.toml") -> Config:
             f"config.toml thiếu (các) section bắt buộc: {missing}. "
             f"Cần có đủ [api], [tts], [processing], [paths]."
         )
+
+    data = _apply_ci_safe_overrides(data)
 
     return Config(data, config_path)
 
