@@ -1,119 +1,126 @@
 name: Run AI Director Video Pipeline
 
-# Chạy khi: push lên main, bấm tay (Actions -> Run workflow), hoặc theo lịch
-# 08:00 sáng (giờ Việt Nam, UTC+7) mỗi ngày = 01:00 UTC.
+# ĐÃ ĐỔI SANG DÙNG THẲNG config.toml (đã commit kèm API key thật vào repo
+# theo README mục "Chạy tự động bằng GitHub Actions") — KHÔNG dùng
+# config.ci.toml.template + GitHub Secrets nữa. Rủi ro (repo public lộ key)
+# người dùng đã tự xác nhận chấp nhận; workflow này chỉ đọc thẳng config.toml
+# có sẵn trong repo, không render gì thêm.
+
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
   schedule:
+    # 01:00 UTC = 08:00 giờ Việt Nam (UTC+7), chạy mỗi ngày.
     - cron: "0 1 * * *"
   workflow_dispatch: {}
 
-# Không cho 2 lần chạy chồng lên nhau (vd. vừa push vừa tới giờ lịch chạy
-# cùng lúc) — job sau xếp hàng chờ thay vì chạy song song và tranh checkpoint
-# trên cùng 1 project.
 concurrency:
-  group: ai-director-pipeline
+  # Không cho 2 lần chạy chồng lên nhau (tránh 2 job cùng đụng vào 1 project
+  # trên cloud cùng lúc — checkpoint/cloud sync không được thiết kế cho
+  # ghi đồng thời).
+  group: ai-director-video-pipeline
   cancel-in-progress: false
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    # Giới hạn cứng của GitHub Actions là 6 giờ/job (360 phút) và không thể
-    # tăng — đặt 350 để job tự dừng sớm hơn vài phút, đủ thời gian ghi
-    # checkpoint cuối cùng và upload log gọn gàng thay vì bị kill giữa chừng.
+    # Chừa dư so với giới hạn cứng 6h/job của GitHub để job luôn có cơ hội
+    # chạy xong bước dọn rác + đóng dashboard gọn gàng thay vì bị kill giữa
+    # chừng đúng lúc đang ghi checkpoint.
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Free disk space (dọn rác runner trước khi tải model local)
+        run: |
+          echo "--- Disk trước khi dọn ---"
+          df -h /
+          # Gỡ các bộ công cụ cài sẵn nhưng project này KHÔNG dùng tới
+          # (.NET, Android SDK, GHC, CodeQL, Boost...) — kỹ thuật quen thuộc
+          # để lấy lại 15-25GB trên runner GitHub-hosted, cần thiết khi ưu
+          # tiên chạy backend "local" (model AI tải về máy) thay vì gọi API.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"/PyPy \
+            /usr/lib/jvm /opt/az 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          sudo apt-get clean || true
+          echo "--- Disk sau khi dọn ---"
+          df -h /
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: requirements.txt
 
-      - name: Dọn bớt disk trên runner (phòng hờ OOM/hết disk)
-        # Runner miễn phí chỉ đảm bảo ~14GB disk trống. Xoá bớt vài bộ SDK
-        # cài sẵn không dùng tới (Android, .NET, Haskell, CodeQL...) để có
-        # thêm khoảng trống an toàn, phòng trường hợp thiếu secret khiến
-        # config.py không override được sang backend nhẹ (xem config.py:
-        # _apply_ci_safe_overrides) và job vẫn phải tải model local.
+      - name: Ensure ffmpeg
         run: |
-          echo "Trước khi dọn:" && df -h /
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
-          echo "Sau khi dọn:" && df -h /
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+          else
+            echo "ffmpeg đã có sẵn trên runner, bỏ qua cài đặt."
+          fi
 
-      - name: Cài FFmpeg
-        # Cài trước bằng sudo ở đây để platform_utils.ensure_ffmpeg() trong
-        # code (gọi "apt-get" KHÔNG có sudo) thấy ffmpeg đã sẵn sàng và bỏ
-        # qua bước tự cài của nó — chạy "apt-get" không sudo trên runner sẽ
-        # bị lỗi quyền (permission denied) vì user chạy job không phải root.
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
-          ffmpeg -version | head -n 1
-
-      - name: Cài Python dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Kiểm tra config.toml đã có sẵn trong repo chưa
-        # Hỗ trợ cả 2 cách README mô tả: (a) commit thẳng config.toml thật
-        # (README có cảnh báo, không khuyến khích với repo public), hoặc
-        # (b) dùng config.ci.toml.template + GitHub Secrets (khuyến khích).
-        # Nếu config.toml đã được checkout ra từ repo, dùng luôn, không ghi
-        # đè bằng bản render từ Secrets (tránh phải thiết lập Secrets nếu
-        # người dùng đã chọn cách (a)).
-        id: check_config
+      - name: Verify config.toml exists
         run: |
-          if [ -f config.toml ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "[ci] Tìm thấy config.toml có sẵn trong repo — dùng luôn, bỏ qua bước dựng từ Secrets."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          if [ ! -f config.toml ]; then
+            echo "::error::Không tìm thấy config.toml trong repo. Xem README mục" \
+                 "'Chạy tự động bằng GitHub Actions' để commit file này (kèm API key thật)."
+            exit 1
           fi
 
-      - name: Dựng config.toml từ Secrets
-        if: steps.check_config.outputs.exists == 'false'
-        env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          CLOUD_ACCESS_KEY: ${{ secrets.CLOUD_ACCESS_KEY }}
-          CLOUD_SECRET_KEY: ${{ secrets.CLOUD_SECRET_KEY }}
-          CLOUD_BUCKET_NAME: ${{ secrets.CLOUD_BUCKET_NAME }}
-          CLOUD_ENDPOINT_URL: ${{ secrets.CLOUD_ENDPOINT_URL }}
-          CLOUD_REGION_NAME: ${{ secrets.CLOUD_REGION_NAME }}
-          CLOUD_ADDRESSING_STYLE: ${{ secrets.CLOUD_ADDRESSING_STYLE }}
-        run: python .github/scripts/render_ci_config.py
+      - name: Start progress dashboard tunnel (Cloudflare Quick Tunnel)
+        run: |
+          # Cloudflare Quick Tunnel: KHÔNG cần tài khoản Cloudflare, KHÔNG cần
+          # API token/DNS riêng — chỉ cần binary cloudflared, tự cấp 1 link
+          # https://xxxx.trycloudflare.com sống trong lúc tiến trình còn chạy.
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8787 > cloudflared.log 2>&1 &
+          disown
 
-      - name: Chạy pipeline (project mới nhất chưa xong)
+          echo "Đang đợi cloudflared cấp link (tối đa 30s)..."
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -n1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 1
+          done
+
+          {
+            echo "### 📺 Theo dõi tiến trình pipeline trực tiếp"
+            if [ -n "$URL" ]; then
+              echo "$URL"
+              echo ""
+              echo "_Link chỉ tồn tại trong lúc job này đang chạy — hiện % hoàn tất từng" \
+                   "stage kèm ETA dự đoán, tự làm mới mỗi 3 giây._"
+            else
+              echo "⚠️ Không lấy được link sau 30s — xem log bước này hoặc file \`cloudflared.log\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "PROGRESS_URL=${URL:-unavailable}" >> "$GITHUB_ENV"
+          echo "Link dashboard: ${URL:-(không lấy được)}"
+
+      - name: Run pipeline (ci_run_latest_project.py)
         run: python ci_run_latest_project.py
 
-      # Máy ảo bị xoá sạch sau khi job kết thúc nên bước này không thật sự
-      # cần thiết để "dọn dẹp", nhưng vẫn xoá config.toml (chứa key thật vừa
-      # render ra) ngay khi xong việc, đề phòng bước debug/artifact phía sau
-      # lỡ đọc nhầm thư mục gốc.
-      - name: Xoá config.toml chứa key thật
+      - name: Stop tunnel
         if: always()
-        run: rm -f config.toml
+        run: |
+          pkill -f "cloudflared tunnel" || true
 
-      # Nếu job lỗi giữa chừng, đính kèm log/metadata của project đang xử lý
-      # để dễ chẩn đoán — KHÔNG đính kèm video/audio (quá nặng, và bản đầy đủ
-      # đã có trên cloud rồi nếu sync thành công trước lúc lỗi).
-      - name: Upload log khi lỗi (để debug)
-        if: failure()
+      - name: Upload cloudflared log (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-director-debug-${{ github.run_id }}
-          path: |
-            projects/**/_project_meta.json
-            projects/**/checkpoints/**/*.json
+          name: cloudflared-log
+          path: cloudflared.log
           if-no-files-found: ignore
           retention-days: 3
