@@ -37,6 +37,17 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
+      - name: Dọn bớt disk trên runner (phòng hờ OOM/hết disk)
+        # Runner miễn phí chỉ đảm bảo ~14GB disk trống. Xoá bớt vài bộ SDK
+        # cài sẵn không dùng tới (Android, .NET, Haskell, CodeQL...) để có
+        # thêm khoảng trống an toàn, phòng trường hợp thiếu secret khiến
+        # config.py không override được sang backend nhẹ (xem config.py:
+        # _apply_ci_safe_overrides) và job vẫn phải tải model local.
+        run: |
+          echo "Trước khi dọn:" && df -h /
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          echo "Sau khi dọn:" && df -h /
+
       - name: Cài FFmpeg
         # Cài trước bằng sudo ở đây để platform_utils.ensure_ffmpeg() trong
         # code (gọi "apt-get" KHÔNG có sudo) thấy ffmpeg đã sẵn sàng và bỏ
