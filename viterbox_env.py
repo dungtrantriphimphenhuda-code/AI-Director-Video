@@ -20,6 +20,7 @@ dùng 1 lần.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,11 +29,46 @@ _VENV_DIRNAME = ".viterbox_venv"
 _VITERBOX_GIT_URL = "git+https://github.com/iamdinhthuan/viterbox-tts.git"
 _MARKER_NAME = ".install_ok"
 
+# Package `viterbox` (upstream: iamdinhthuan/viterbox-tts) dùng các module này
+# ở runtime (qua s3tokenizer / s3gen / conformer...) nhưng KHÔNG khai báo
+# chúng trong pyproject.toml của chính nó -> pip không tự cài, gây lỗi
+# "No module named 'omegaconf'" (và có thể thiếu thêm module tương tự tuỳ
+# version). Ta cài bù các dependency còn thiếu này ngay sau khi cài viterbox,
+# bất kể chạy trên máy nào (không riêng gì GitHub Actions).
+_KNOWN_MISSING_DEPS = [
+    "omegaconf",
+]
+
+# Map "tên module khi import" -> "tên package khi pip install", cho các
+# trường hợp 2 tên khác nhau (phòng khi auto-heal ở dưới gặp phải).
+_MODULE_TO_PIP_NAME = {
+    "yaml": "pyyaml",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+}
+
 
 def _venv_python(venv_dir: Path) -> Path:
     if sys.platform == "win32":
         return venv_dir / "Scripts" / "python.exe"
     return venv_dir / "bin" / "python"
+
+
+def _pip_install(py: Path, *packages: str) -> None:
+    subprocess.run([str(py), "-m", "pip", "install", *packages], check=True)
+
+
+def _self_test_import(py: Path) -> tuple[bool, str]:
+    """Thử `import viterbox` trong venv, trả về (thành_công, tên_module_thiếu_nếu_có)."""
+    result = subprocess.run(
+        [str(py), "-c", "import viterbox"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    match = re.search(r"No module named '([^']+)'", result.stderr)
+    missing = match.group(1).split(".")[0] if match else ""
+    return False, missing
 
 
 def ensure_viterbox_env(project_root: Path) -> Path:
@@ -45,14 +81,24 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     cùng 1 máy (quan trọng khi chạy lặp lại trên máy thật/self-hosted runner;
     trên GitHub Actions hosted runner thì venv bị xoá cùng máy ảo sau mỗi
     job nên vẫn phải cài lại mỗi lần dù có marker hay không).
+
+    Sau khi cài xong, LUÔN chạy self-test `import viterbox` trong venv. Nếu
+    thiếu module (như 'omegaconf' — bug ở gói viterbox gốc, không khai báo
+    dependency đầy đủ), tự động pip install bù và thử lại, tối đa vài lần.
+    Nhờ vậy hàm này tự "chữa lành" trên bất kỳ thiết bị nào (máy thật, Colab,
+    VPS, GitHub Actions...), không cần sửa tay mỗi lần môi trường khác nhau.
     """
     venv_dir = project_root / _VENV_DIRNAME
     marker = venv_dir / _MARKER_NAME
     py = _venv_python(venv_dir)
 
     if marker.exists() and py.exists():
-        print(f"[viterbox-env] venv riêng đã sẵn sàng tại {venv_dir}")
-        return py
+        ok, missing = _self_test_import(py)
+        if ok:
+            print(f"[viterbox-env] venv riêng đã sẵn sàng tại {venv_dir}")
+            return py
+        print(f"[viterbox-env] venv cũ bị thiếu module '{missing}', cài bù rồi kiểm tra lại...")
+        marker.unlink(missing_ok=True)
 
     if not py.exists():
         print(f"[viterbox-env] Tạo venv riêng cho Viterbox tại {venv_dir}...")
@@ -62,8 +108,37 @@ def ensure_viterbox_env(project_root: Path) -> Path:
           "torch/transformers/numpy phiên bản do viterbox tự ghim, KHÔNG liên "
           "quan tới version trong requirements.txt chính) — lần đầu có thể mất "
           "vài phút vì phải tải torch + model AI (~3-4GB)...")
-    subprocess.run([str(py), "-m", "pip", "install", "--upgrade", "pip"], check=True)
-    subprocess.run([str(py), "-m", "pip", "install", _VITERBOX_GIT_URL], check=True)
+    _pip_install(py, "--upgrade", "pip")
+    _pip_install(py, _VITERBOX_GIT_URL)
+
+    # Cài bù các dependency mà gói viterbox gốc quên khai báo (xem
+    # _KNOWN_MISSING_DEPS ở trên) — làm ngay để đỡ phải chờ self-test loop.
+    print(f"[viterbox-env] Cài bù dependency còn thiếu ở gói viterbox gốc: {_KNOWN_MISSING_DEPS}...")
+    _pip_install(py, *_KNOWN_MISSING_DEPS)
+
+    # Self-test + auto-heal: nếu vẫn còn thiếu module khác (chưa biết trước),
+    # tự phát hiện qua thông báo lỗi và cài bù, lặp lại tối đa 5 lần.
+    for attempt in range(1, 6):
+        ok, missing = _self_test_import(py)
+        if ok:
+            break
+        if not missing:
+            raise RuntimeError(
+                "[viterbox-env] `import viterbox` lỗi nhưng không xác định "
+                "được tên module bị thiếu để tự cài bù — cần kiểm tra thủ công."
+            )
+        pip_name = _MODULE_TO_PIP_NAME.get(missing, missing)
+        print(f"[viterbox-env] (lần {attempt}/5) Thiếu module '{missing}', "
+              f"tự cài bù '{pip_name}'...")
+        _pip_install(py, pip_name)
+    else:
+        ok, missing = _self_test_import(py)
+        if not ok:
+            raise RuntimeError(
+                f"[viterbox-env] Vẫn lỗi `import viterbox` sau nhiều lần tự "
+                f"cài bù (module thiếu cuối cùng: '{missing}'). Cần kiểm tra "
+                f"thủ công, có thể do lỗi khác ngoài thiếu dependency."
+            )
 
     marker.write_text("ok", encoding="utf-8")
     print("[viterbox-env] Cài xong.")
