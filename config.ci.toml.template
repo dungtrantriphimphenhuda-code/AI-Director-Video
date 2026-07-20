@@ -35,7 +35,20 @@ mistral_api_key = "${MISTRAL_API_KEY}"
 mistral_base_url = "https://api.mistral.ai/v1"
 
 [tts]
-engine = "edge-tts"
+# viterbox chạy LOCAL (không phụ thuộc dịch vụ ngoài) -> tránh hẳn lỗi
+# "edge_tts.exceptions.NoAudioReceived" hay gặp khi edge-tts chạy từ IP
+# datacenter của GitHub Actions (bị chặn/rate-limit phía Microsoft).
+# ĐÁNH ĐỔI: runner miễn phí KHÔNG có GPU -> stage TTS sẽ chậm hơn nhiều so
+# với chạy trên máy/Colab có GPU (có thể vài chục giây/câu). Nếu video dài
+# và gặp timeout job, cân nhắc đổi lại engine = "edge-tts" (chấp nhận rủi ro
+# lỗi mạng thoáng qua) hoặc chạy stage TTS riêng trên máy có GPU.
+engine = "viterbox"
+viterbox_language = "vi"
+viterbox_exaggeration = 0.5
+viterbox_cfg_weight = 0.5
+viterbox_temperature = 0.8
+
+# ---- edge-tts (dự phòng) ----
 voice = "vi-VN-HoangMinhNeural"
 rate = "+0%"
 volume = "+0%"

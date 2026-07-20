@@ -45,8 +45,27 @@ mistral_api_key = "WJkOtf6FxncjGsfLs2mujxew0ikNIDKX"
 mistral_base_url = "https://api.mistral.ai/v1"
 
 [tts]
-# edge-tts: no API key needed, just select voice
-engine = "edge-tts"
+# "edge-tts": API không chính thức của Microsoft, hay bị chặn/rớt kết nối
+# (NoAudioReceived) khi chạy từ IP datacenter như GitHub Actions.
+# "viterbox": model TTS tiếng Việt LOCAL (fine-tune từ Chatterbox), không phụ
+# thuộc dịch vụ ngoài -> không bị lỗi mạng như trên. Chạy trong venv riêng
+# (.viterbox_venv, tự tạo lần đầu chạy) vì package viterbox ghim version
+# numpy/transformers xung đột với requirements.txt chính.
+engine = "viterbox"
+
+# ---- viterbox ----
+# null = tự phát hiện GPU (cuda nếu có, cpu nếu không). Ép "cpu" nếu muốn
+# chạy CPU dù có GPU (vd tiết kiệm VRAM cho tác vụ khác đang chạy song song).
+# viterbox_device = "cuda"
+viterbox_language = "vi"
+# Đường dẫn tới 1 file audio mẫu (3-10s, sạch, không nhiễu) nếu muốn voice
+# cloning theo giọng riêng. Để trống -> dùng giọng mặc định có sẵn của model.
+# viterbox_audio_prompt = "./my_voice_sample.wav"
+viterbox_exaggeration = 0.5
+viterbox_cfg_weight = 0.5
+viterbox_temperature = 0.8
+
+# ---- edge-tts (dự phòng, dùng khi engine = "edge-tts") ----
 # Vietnamese: "vi-VN-HoangMinhNeural", "vi-VN-NamMinhNeural"
 # English: "en-US-JennyNeural", "en-US-GuyNeural"
 voice = "vi-VN-HoangMinhNeural"

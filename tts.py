@@ -1,13 +1,27 @@
 """
-tts.py — sinh giọng đọc (voiceover) cho từng câu trong storyboard bằng edge-tts.
+tts.py — sinh giọng đọc (voiceover) cho từng câu trong storyboard.
 
-edge-tts không cần API key. Mỗi câu narration được tổng hợp thành 1 file .mp3
-riêng, sau đó ghép lại thành 1 file audio tổng (voiceover.mp3) với timestamp
-đặt đúng theo `timeline[].output.start` trong storyboard.json — để đồng bộ
-với video render ở bước sau.
+Hỗ trợ 2 engine, chọn qua `tts.engine` trong config.toml:
+  - "edge-tts" (mặc định): dùng edge-tts, không cần API key, không cần GPU.
+    LƯU Ý: đây là API không chính thức của Microsoft, thỉnh thoảng bị chặn/
+    rớt kết nối khi chạy từ IP datacenter (vd GitHub Actions) — lỗi
+    "edge_tts.exceptions.NoAudioReceived".
+  - "viterbox": model TTS tiếng Việt chạy LOCAL (fine-tune từ Chatterbox,
+    xem viterbox_env.py / viterbox_worker.py), không phụ thuộc dịch vụ ngoài
+    nên không bị lỗi mạng như trên. Cần tải model (~3-4GB) lần đầu, chạy
+    nhanh trên GPU và chậm hơn nhiều trên CPU. Chạy trong 1 venv RIÊNG
+    (.viterbox_venv) vì package `viterbox` ghim version numpy/transformers
+    xung đột với requirements.txt chính của project.
 
-Vì đây là module I/O bất đồng bộ (edge-tts dùng asyncio), ta bọc lại bằng
-asyncio.run() để module còn lại (đồng bộ) có thể gọi bình thường.
+Mỗi câu narration được tổng hợp thành 1 file audio riêng, sau đó ghép lại
+thành 1 file audio tổng (voiceover.mp3) với timestamp đặt đúng theo
+`timeline[].output.start` trong storyboard.json — để đồng bộ với video render
+ở bước sau.
+
+edge-tts dùng asyncio (bọc lại bằng asyncio.run() để phần còn lại của
+pipeline, vốn đồng bộ, gọi bình thường). viterbox chạy đồng bộ qua subprocess
+(model AI, không hưởng lợi gì từ việc chạy song song nhiều luồng như network
+I/O của edge-tts).
 """
 
 from __future__ import annotations
@@ -116,6 +130,132 @@ async def _synthesize_all(
     return paths  # type: ignore[return-value]
 
 
+def _cuda_available_hint() -> bool:
+    """Kiểm tra nhanh có GPU NVIDIA khả dụng không. Import torch CỤC BỘ (không
+    ở module scope) vì torch có thể chưa được cài trong tiến trình chính nếu
+    người dùng chỉ dùng backend API cho vision/script -- best-effort, không
+    quan trọng nếu không xác định được (mặc định coi như không có GPU)."""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _synthesize_all_viterbox(
+    sentences: list[dict[str, Any]],
+    cfg,
+    out_dir: Path,
+    checkpoint_mgr=None,
+) -> list[Path]:
+    """
+    Sinh audio bằng backend 'viterbox': model TTS tiếng Việt chạy LOCAL (fine-
+    tune từ Chatterbox), KHÔNG phụ thuộc dịch vụ đám mây của Microsoft như
+    edge-tts -- không bị ảnh hưởng bởi việc edge-tts hay bị chặn/rớt kết nối
+    (lỗi "NoAudioReceived") khi chạy từ IP datacenter như GitHub Actions.
+
+    Chạy trong 1 venv RIÊNG (.viterbox_venv, xem viterbox_env.py) qua
+    subprocess vì package `viterbox` ghim version numpy/transformers xung đột
+    với requirements.txt chính -- KHÔNG import/chạy trực tiếp trong tiến
+    trình Python hiện tại.
+    """
+    import viterbox_env  # import cục bộ: chỉ cần khi thực sự dùng engine này
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    project_root = Path(__file__).parent
+    venv_python = viterbox_env.ensure_viterbox_env(project_root)
+
+    device = cfg.get("tts.viterbox_device") or ("cuda" if _cuda_available_hint() else "cpu")
+    if device == "cpu":
+        print("[tts] CẢNH BÁO: chạy Viterbox trên CPU (không có GPU) — chậm hơn NHIỀU "
+              "so với GPU, có thể vài chục giây/câu. Với video dài + chạy trên GitHub "
+              "Actions runner miễn phí (không có GPU), stage này có thể mất rất lâu; "
+              "cân nhắc chạy trên máy/Colab có GPU nếu cần nhanh hơn.")
+
+    audio_prompt = cfg.get("tts.viterbox_audio_prompt")
+    if audio_prompt:
+        audio_prompt = str(cfg.resolve_path("tts.viterbox_audio_prompt"))
+
+    done_ids: set[str] = set()
+    if checkpoint_mgr is not None:
+        done_ids = checkpoint_mgr.list_micro_done("tts")
+
+    total = len(sentences)
+    paths: list[Path | None] = [None] * total
+    pending: list[dict[str, Any]] = []
+    for i, sent in enumerate(sentences):
+        clip_id = sent["clip_id"]
+        out_path = out_dir / f"{clip_id}.wav"
+        paths[i] = out_path
+        if clip_id in done_ids and out_path.exists():
+            continue
+        pending.append({"clip_id": clip_id, "text": sent["sentence"], "out_path": str(out_path), "_idx": i})
+
+    skipped = total - len(pending)
+    if skipped:
+        print(f"[tts] Bỏ qua {skipped}/{total} câu đã tổng hợp sẵn (resume từ checkpoint).")
+
+    if not pending:
+        return paths  # type: ignore[return-value]
+
+    job = {
+        "device": device,
+        "language": cfg.get("tts.viterbox_language", "vi"),
+        "audio_prompt": audio_prompt,
+        "exaggeration": cfg.get("tts.viterbox_exaggeration", 0.5),
+        "cfg_weight": cfg.get("tts.viterbox_cfg_weight", 0.5),
+        "temperature": cfg.get("tts.viterbox_temperature", 0.8),
+        "items": [{"clip_id": it["clip_id"], "text": it["text"], "out_path": it["out_path"]} for it in pending],
+    }
+    job_path = out_dir / "_viterbox_job.json"
+    with open(job_path, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False)
+
+    worker_script = project_root / "viterbox_worker.py"
+    print(f"[tts] Synthesizing {len(pending)} câu bằng Viterbox (device={device})...")
+
+    idx_by_clip = {it["clip_id"]: it["_idx"] for it in pending}
+    done_count = skipped
+    proc = subprocess.Popen(
+        [str(venv_python), str(worker_script), str(job_path)],
+        stdout=subprocess.PIPE, text=True, bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        if line == "VITERBOX_MODEL_LOADED":
+            print("[tts] Viterbox model đã load xong, bắt đầu tổng hợp...")
+        elif line.startswith("VITERBOX_OK "):
+            clip_id = line.split(" ", 1)[1]
+            done_count += 1
+            print_progress_bar(done_count, total, prefix="[tts] synthesizing", suffix=clip_id)
+            if checkpoint_mgr is not None:
+                idx = idx_by_clip[clip_id]
+                checkpoint_mgr.save_micro("tts", clip_id, {
+                    "clip_id": clip_id,
+                    "audio_path": str(paths[idx]),
+                })
+        elif line.startswith("VITERBOX_ERR "):
+            print(f"[tts] LỖI từ viterbox-worker: {line}")
+        elif line != "VITERBOX_DONE":
+            print(f"[viterbox-worker] {line}")
+
+    returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(
+            f"viterbox_worker.py thoát với mã lỗi {returncode} — xem log phía trên để biết câu "
+            f"nào lỗi. Checkpoint đã lưu các câu tổng hợp thành công trước đó, chạy lại pipeline "
+            f"sẽ resume tiếp từ đúng chỗ dừng."
+        )
+
+    if checkpoint_mgr is not None:
+        checkpoint_mgr.flush_pending_syncs()
+
+    return paths  # type: ignore[return-value]
+
+
 def _ffprobe_duration(path: Path) -> float:
     cmd = [
         "ffprobe", "-v", "error",
@@ -179,24 +319,28 @@ def run_tts(cfg, storyboard: dict[str, Any], checkpoint_mgr=None) -> dict[str, A
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
     engine = cfg.get("tts.engine", "edge-tts")
-    if engine != "edge-tts":
-        print(f"[tts] CẢNH BÁO: tts.engine = '{engine}' trong config.toml, nhưng hiện tại "
-              f"chỉ có engine 'edge-tts' được cài đặt thật sự — vẫn dùng edge-tts, "
-              f"giá trị '{engine}' không có tác dụng.")
-
-    voice = cfg.get("tts.voice", "vi-VN-HoangMinhNeural")
-    rate = cfg.get("tts.rate", "+0%")
-    volume = cfg.get("tts.volume", "+0%")
-    pitch = cfg.get("tts.pitch", "+0Hz")
-    max_concurrency = cfg.get("tts.max_concurrency", 40)
+    if engine not in ("edge-tts", "viterbox"):
+        print(f"[tts] CẢNH BÁO: tts.engine = '{engine}' trong config.toml không hợp lệ "
+              f"(chỉ hỗ trợ 'edge-tts' hoặc 'viterbox') — dùng 'edge-tts' mặc định.")
+        engine = "edge-tts"
 
     sentences = storyboard["timeline"]
-    print(f"[tts] Synthesizing {len(sentences)} câu bằng edge-tts (voice={voice}, "
-          f"song song tối đa {max_concurrency} luồng)...")
-    clip_audio_paths = asyncio.run(
-        _synthesize_all(sentences, voice, rate, volume, pitch, tts_dir,
-                         checkpoint_mgr=checkpoint_mgr, max_concurrency=max_concurrency)
-    )
+
+    if engine == "viterbox":
+        clip_audio_paths = _synthesize_all_viterbox(sentences, cfg, tts_dir, checkpoint_mgr=checkpoint_mgr)
+    else:
+        voice = cfg.get("tts.voice", "vi-VN-HoangMinhNeural")
+        rate = cfg.get("tts.rate", "+0%")
+        volume = cfg.get("tts.volume", "+0%")
+        pitch = cfg.get("tts.pitch", "+0Hz")
+        max_concurrency = cfg.get("tts.max_concurrency", 40)
+
+        print(f"[tts] Synthesizing {len(sentences)} câu bằng edge-tts (voice={voice}, "
+              f"song song tối đa {max_concurrency} luồng)...")
+        clip_audio_paths = asyncio.run(
+            _synthesize_all(sentences, voice, rate, volume, pitch, tts_dir,
+                             checkpoint_mgr=checkpoint_mgr, max_concurrency=max_concurrency)
+        )
 
     # Đo lại thời lượng thực tế TTS để phát hiện lệch lớn so với output_duration ước tính.
     actual_durations = []

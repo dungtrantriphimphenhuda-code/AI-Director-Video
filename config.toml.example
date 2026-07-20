@@ -21,7 +21,13 @@ mistral_api_key = "PASTE_YOUR_MISTRAL_API_KEY_HERE"
 mistral_base_url = "https://api.mistral.ai/v1"
 
 [tts]
-# edge-tts: không cần API key, chỉ cần chọn giọng.
+# edge-tts: không cần API key, chỉ cần chọn giọng. Lưu ý: API không chính
+# thức của Microsoft, thỉnh thoảng bị chặn/rớt kết nối khi chạy từ IP
+# datacenter (vd GitHub Actions) -> lỗi "NoAudioReceived".
+# "viterbox": model TTS tiếng Việt LOCAL (không cần mạng ngoài lúc chạy, chỉ
+# cần mạng lúc tải model lần đầu ~3-4GB), chạy trong venv riêng tự tạo
+# (.viterbox_venv) — xem tts.py, viterbox_env.py để biết chi tiết + các key
+# "viterbox_*" cấu hình được (device, audio_prompt để voice cloning, v.v.).
 engine = "edge-tts"
 # Giọng mặc định. Ví dụ khác: "en-US-JennyNeural", "vi-VN-NamMinhNeural"
 voice = "vi-VN-HoangMinhNeural"
