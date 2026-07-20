@@ -59,6 +59,52 @@ VISION_SYSTEM_PROMPT = (
 )
 
 
+def _patch_modelscope_dynamic_module_hijack() -> None:
+    """Sửa lỗi: funasr (ASR stage, chạy TRƯỚC vision stage) import modelscope,
+    và modelscope tự động monkeypatch `get_class_from_dynamic_module` bên trong
+    nhiều submodule `transformers.models.auto.*` để mọi model tải qua
+    `trust_remote_code=True` (kể cả model KHÔNG liên quan gì tới modelscope,
+    như Moondream2/Qwen3-VL ở đây) bị "hijack" sang tải qua ModelScope Hub
+    thay vì Hugging Face Hub.
+
+    Với modelscope 1.38.1 + transformers 4.57.6, bản patch đó có bug: nó gọi
+    `args[0] = snapshot_download(...)` trong khi `args` lúc này là 1 tuple
+    (immutable) -> crash ngay khi bắt đầu load model:
+        TypeError: 'tuple' object does not support item assignment
+    (modelscope/utils/hf_util/patcher.py, hàm get_class_from_dynamic_module)
+
+    Cách sửa: modelscope patch bằng cách rebind lại tên
+    `get_class_from_dynamic_module` trong namespace của TỪNG submodule auto
+    (configuration_auto, auto_factory, tokenization_auto, ...) — bản gốc,
+    chưa bị sửa, vẫn còn nguyên trong `transformers.dynamic_module_utils`.
+    Nên chỉ cần rebind lại các tên đó về đúng hàm gốc là vô hiệu hoá hijack,
+    không cần biết chi tiết modelscope patch thế nào / không cần gỡ cài đặt
+    modelscope (vẫn cần cho FunASR ở ASR stage).
+    """
+    try:
+        import transformers.dynamic_module_utils as _dmu
+        original_fn = _dmu.get_class_from_dynamic_module
+    except Exception:
+        return  # transformers chưa cài / đổi cấu trúc module -> bỏ qua, không crash pipeline
+
+    submodule_names = [
+        "transformers.models.auto.configuration_auto",
+        "transformers.models.auto.auto_factory",
+        "transformers.models.auto.tokenization_auto",
+        "transformers.models.auto.image_processing_auto",
+        "transformers.models.auto.feature_extraction_auto",
+        "transformers.models.auto.processing_auto",
+    ]
+    import importlib
+    for mod_name in submodule_names:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        if getattr(mod, "get_class_from_dynamic_module", None) is not original_fn:
+            mod.get_class_from_dynamic_module = original_fn
+
+
 def _parse_json_response(text: str) -> dict[str, Any]:
     """Cố gắng parse JSON từ output model; nếu lỗi, trả về kết quả rỗng an toàn."""
     text = text.strip()
@@ -132,6 +178,7 @@ class LocalVisionAnalyzer:
         import torch  # lazy import: chỉ cần khi thực sự dùng backend "local"
         from transformers import AutoModelForImageTextToText, AutoProcessor
         self._torch = torch
+        _patch_modelscope_dynamic_module_hijack()
         dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(
             self.dtype_name, torch.float16
         )
@@ -534,6 +581,7 @@ class MoondreamVisionAnalyzer:
         import torch  # lazy import: chỉ cần khi thực sự dùng backend "moondream"
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self._torch = torch
+        _patch_modelscope_dynamic_module_hijack()
         _patch_transformers_v5_tied_weights_compat()
 
         print(f"[vision] Loading {self.model_name} (rev={self.revision or 'main'}) "
