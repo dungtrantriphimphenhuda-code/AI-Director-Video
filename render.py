@@ -41,6 +41,7 @@ def shift_source_timestamps(
     storyboard: dict[str, Any],
     chars_per_sec: float,
     words_per_sec: float = 2.5,
+    safety_margin: float = 1.0,
 ) -> dict[str, Any]:
     """
     源时间戳前移: new_source_start = max(0, source_start - thời_lượng_đọc_ước_tính).
@@ -52,7 +53,7 @@ def shift_source_timestamps(
     """
     for clip in storyboard["timeline"]:
         # buffer_after=0 ở đây vì ta chỉ cần thời lượng ĐỌC, không cộng buffer.
-        tts_dur = calc_output_duration(clip["sentence"], chars_per_sec, 0.0, 0.0, words_per_sec)
+        tts_dur = calc_output_duration(clip["sentence"], chars_per_sec, 0.0, 0.0, words_per_sec, safety_margin)
         src = clip["source"]
         src_span = src["end"] - src["start"]
         new_start = max(0.0, src["start"] - tts_dur)
@@ -81,24 +82,53 @@ def render_clip(
     tts_audio_path: Path | None,
     out_path: Path,
     max_speed_ratio: float = 4.0,
+    min_speed_ratio: float = 0.5,
 ) -> None:
-    """Render 1 clip: cắt theo source, chỉnh tốc độ khớp output_duration, mix TTS + tiếng gốc (duck)."""
+    """Render 1 clip: cắt theo source, chỉnh tốc độ khớp output_duration, mix TTS + tiếng gốc (duck).
+
+    Tốc độ tua nhanh/chậm được KẸP trong [min_speed_ratio, max_speed_ratio]
+    thay vì chỉ in cảnh báo rồi vẫn dùng tốc độ cực đoan như trước — trước
+    đây max_speed_ratio chỉ là 1 dòng log, ffmpeg vẫn tua/kéo clip gốc theo
+    đúng tỉ lệ toán học src_dur/out_dur dù có thể ra tới hàng chục lần, khiến
+    clip trông "gấp" (tua nhanh vượt max) hoặc "lê thê" (kéo chậm dưới min).
+    Khi kẹp tốc độ khiến video ngắn hơn out_dur (trường hợp lẽ ra phải kéo
+    chậm hơn nữa), phần thiếu được bù bằng cách đông cứng khung hình cuối
+    (tpad) thay vì để clip kết thúc sớm và lệch thời lượng so với storyboard.
+    """
     src = clip["source"]
     out = clip["output"]
     src_dur = max(src["end"] - src["start"], 0.1)
     out_dur = max(out["end"] - out["start"], 0.1)
-    speed = src_dur / out_dur
+    natural_speed = src_dur / out_dur
+    speed = min(max(natural_speed, min_speed_ratio), max_speed_ratio)
 
-    if speed > max_speed_ratio:
-        print(f"[render] Cảnh báo: {clip['clip_id']} speed={speed:.2f}x vượt max_speed_ratio={max_speed_ratio}")
+    if natural_speed > max_speed_ratio:
+        print(
+            f"[render] {clip['clip_id']}: tốc độ tự nhiên {natural_speed:.2f}x vượt "
+            f"max_speed_ratio={max_speed_ratio} -> kẹp còn {speed:.2f}x (clip sẽ chỉ chiếu "
+            "hết phần đầu của cảnh gốc trong thời lượng lời bình cho phép)."
+        )
+    elif natural_speed < min_speed_ratio:
+        print(
+            f"[render] {clip['clip_id']}: tốc độ tự nhiên {natural_speed:.2f}x dưới "
+            f"min_speed_ratio={min_speed_ratio} -> kẹp còn {speed:.2f}x (bù phần thời lượng "
+            "còn thiếu bằng đông cứng khung hình cuối thay vì kéo chậm quá mức)."
+        )
+
+    # Thời lượng video thật sự sau khi cắt+chỉnh tốc độ (kẹp) — có thể khác out_dur
+    # nếu speed đã bị kẹp khỏi giá trị tự nhiên.
+    cut_dur = src_dur / speed
+    pad_needed = max(out_dur - cut_dur, 0.0)
 
     video_only = out_path.with_suffix(".novoice.mp4")
 
     if abs(speed - 1.0) < 0.01:
+        vf = f"tpad=stop_mode=clone:stop_duration={pad_needed:.3f}" if pad_needed > 0.05 else None
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(src["start"]), "-t", str(src_dur),
             "-i", input_video,
+            *(["-vf", vf] if vf else []),
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
             "-af", "volume=0.15",
             "-c:a", "aac", "-b:a", "128k",
@@ -106,12 +136,14 @@ def render_clip(
         ]
     else:
         atempo_chain = _atempo_chain(speed)
+        vpts = f"setpts={1/speed:.4f}*PTS"
+        vf_chain = f"{vpts},tpad=stop_mode=clone:stop_duration={pad_needed:.3f}" if pad_needed > 0.05 else vpts
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(src["start"]), "-t", str(src_dur),
             "-i", input_video,
             "-filter_complex",
-            f"[0:v]setpts={1/speed:.4f}*PTS[v];[0:a]{atempo_chain},volume=0.15[a]",
+            f"[0:v]{vf_chain}[v];[0:a]{atempo_chain},volume=0.15[a]",
             "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
             "-c:a", "aac", "-b:a", "128k",
@@ -221,10 +253,12 @@ def run_render(cfg, storyboard: dict[str, Any], tts_result: dict[str, Any] | Non
     input_video = storyboard["task"]["input_video"]
     chars_per_sec = cfg.get("processing.chars_per_sec", 4.0)
     words_per_sec = cfg.get("processing.words_per_sec", 2.5)
+    safety_margin = cfg.get("processing.speech_safety_margin", 1.0)
     max_speed_ratio = cfg.get("processing.max_speed_ratio", 4.0)
+    min_speed_ratio = cfg.get("processing.min_speed_ratio", 0.5)
 
     print("[render] Dịch source timestamp lùi theo thời lượng TTS...")
-    storyboard = shift_source_timestamps(storyboard, chars_per_sec, words_per_sec)
+    storyboard = shift_source_timestamps(storyboard, chars_per_sec, words_per_sec, safety_margin)
     with open(pipeline_dir / "storyboard.json", "w", encoding="utf-8") as f:
         json.dump(storyboard, f, ensure_ascii=False, indent=2)
 
@@ -252,7 +286,7 @@ def run_render(cfg, storyboard: dict[str, Any], tts_result: dict[str, Any] | Non
             print_progress_bar(idx, total_clips, prefix="[render] clips (resumed)", suffix=clip["clip_id"])
             continue
 
-        render_clip(input_video, clip, tts_audio_map.get(clip["clip_id"]), out_path, max_speed_ratio)
+        render_clip(input_video, clip, tts_audio_map.get(clip["clip_id"]), out_path, max_speed_ratio, min_speed_ratio)
         clip_paths.append(out_path)
         print_progress_bar(idx, total_clips, prefix="[render] clips", suffix=clip["clip_id"])
 

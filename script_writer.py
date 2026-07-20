@@ -687,7 +687,11 @@ def _narration_user_prompt(
         f"a SEGMENT of the full film, not the whole thing:\n"
         f"{json.dumps(batch_blocks, ensure_ascii=False)}"
     )
-    parts.append(f"Target narration duration for THIS segment: ~{batch_target_duration} seconds.")
+    parts.append(
+        f"Rough timing guide for THIS segment: ~{batch_target_duration} seconds — a loose fallback "
+        "sized by scene count, NOT a quota. Let the actual dramatic weight of these scenes decide "
+        "the real narration length; do not pad or cut sentences just to hit this number."
+    )
     if not is_last:
         parts.append("This is NOT the final segment — do not wrap up the story or add a closing line yet.")
     else:
@@ -881,7 +885,133 @@ def generate_narration(
         s["scene_ids"] = scene_ids
         cleaned.append(s)
 
+    duration_mode = cfg.get("processing.target_duration_mode", "auto")
+    if duration_mode == "fixed":
+        cleaned = _enforce_target_duration(cfg, cleaned, target_total_duration)
+    else:
+        # "auto" (mặc định): KHÔNG ép tổng thời lượng về 1 con số cứng — mỗi
+        # phim có độ dài nội dung tự nhiên khác nhau (cảnh cao trào cần
+        # nhiều lời bình hơn cảnh chuyển tiếp), ép cắt theo 1 target chung
+        # cho mọi video dễ làm mất chỗ đang cần và giữ chỗ không cần (xem
+        # NOTES-AI-DIRECTOR-VIDEO.md). target_duration_sec ở đây chỉ còn là
+        # GỢI Ý mềm để chia batch_target_duration cho từng batch khi soạn
+        # (xem vòng lặp batch phía trên) — không có bước cắt cứng nào sau
+        # khi gộp. Chỉ IN ra ước tính để người dùng biết, không tự sửa.
+        _log_duration_estimate(cfg, cleaned, target_total_duration)
+
     return cleaned
+
+
+def _log_duration_estimate(
+    cfg,
+    sentences: list[dict[str, Any]],
+    target_total_duration: float,
+) -> None:
+    """In ra tổng thời lượng ước tính (chế độ 'auto', không cắt) để người dùng
+    biết trước khi tốn thời gian TTS + render — KHÔNG thay đổi `sentences`."""
+    if not sentences:
+        return
+    chars_per_sec = cfg.get("processing.chars_per_sec", 4.0)
+    words_per_sec = cfg.get("processing.words_per_sec", 2.5)
+    safety_margin = cfg.get("processing.speech_safety_margin", 1.0)
+    buffer_after = cfg.get("processing.buffer_after_speech", 0.1)
+    min_dur = cfg.get("processing.min_clip_duration", 1.0)
+    total = sum(
+        calc_output_duration(s.get("sentence", ""), chars_per_sec, buffer_after, min_dur, words_per_sec, safety_margin)
+        for s in sentences
+    )
+    ratio = total / target_total_duration if target_total_duration else 0.0
+    print(
+        f"[script_writer] processing.target_duration_mode='auto' — không cắt cứng. "
+        f"Tổng narration ước tính: {total:.1f}s ({len(sentences)} câu) so với gợi ý mềm "
+        f"{target_total_duration:.0f}s (x{ratio:.2f}). Nếu muốn ép về đúng "
+        f"{target_total_duration:.0f}s, đặt processing.target_duration_mode = \"fixed\"."
+    )
+
+
+def _enforce_target_duration(
+    cfg,
+    sentences: list[dict[str, Any]],
+    target_total_duration: float,
+) -> list[dict[str, Any]]:
+    """
+    [CHỈ CHẠY khi processing.target_duration_mode = "fixed", opt-in — mặc định
+    pipeline dùng chế độ "auto" và KHÔNG gọi hàm này, xem _log_duration_estimate]
+
+    Cắt bớt narration nếu TỔNG thời lượng ước tính (cộng dồn qua mọi batch)
+    vượt quá target_duration_sec quá xa.
+
+    Trước đây mỗi batch chỉ được giao một `batch_target_duration` TỈ LỆ theo
+    số scene của batch đó (xem generate_narration), nhưng không có bước nào
+    kiểm tra lại TỔNG sau khi gộp — nếu model viết dài hơn target ở mỗi batch
+    (rất hay xảy ra), độ lệch cộng dồn qua hàng chục batch khiến video phình to
+    (video 3 phút mục tiêu ra thành 25+ phút thực tế trong trường hợp thực đo).
+
+    Cách cắt: dùng đúng công thức ước tính thời lượng mà build_storyboard()
+    sẽ dùng thật (calc_output_duration, với chars_per_sec/words_per_sec/
+    buffer_after_speech/min_clip_duration đọc từ config — PHẢI khớp giá trị
+    thật của giọng TTS đang dùng, xem processing.words_per_sec). Nếu tổng vượt
+    quá target * tolerance, loại bỏ dần câu có match_score THẤP NHẤT (câu khớp
+    cảnh yếu nhất) cho tới khi vừa ngân sách — luôn giữ câu đầu (hook/mở đầu)
+    và câu cuối (kết truyện) để narration không bị cụt đầu/đuôi.
+    """
+    if not sentences:
+        return sentences
+
+    tolerance = cfg.get("processing.target_duration_tolerance", 1.15)
+    budget = target_total_duration * tolerance
+
+    chars_per_sec = cfg.get("processing.chars_per_sec", 4.0)
+    words_per_sec = cfg.get("processing.words_per_sec", 2.5)
+    safety_margin = cfg.get("processing.speech_safety_margin", 1.0)
+    buffer_after = cfg.get("processing.buffer_after_speech", 0.1)
+    min_dur = cfg.get("processing.min_clip_duration", 1.0)
+
+    def _dur(s: dict[str, Any]) -> float:
+        return calc_output_duration(
+            s.get("sentence", ""), chars_per_sec, buffer_after, min_dur, words_per_sec, safety_margin
+        )
+
+    kept = list(sentences)
+    total = sum(_dur(s) for s in kept)
+
+    if total <= budget or len(kept) <= 2:
+        return kept
+
+    original_total = total
+    original_count = len(kept)
+
+    # Chỉ số 1..len-2 là "có thể bỏ" — luôn giữ câu đầu và câu cuối.
+    # Sắp theo match_score tăng dần: bỏ câu khớp cảnh yếu nhất trước.
+    droppable_idx = sorted(
+        range(1, len(kept) - 1),
+        key=lambda i: kept[i].get("match_score", 0.0),
+    )
+    to_drop: set[int] = set()
+    for i in droppable_idx:
+        if total <= budget:
+            break
+        total -= _dur(kept[i])
+        to_drop.add(i)
+
+    if to_drop:
+        kept = [s for i, s in enumerate(kept) if i not in to_drop]
+        # Đánh lại sentence_id tuần tự sau khi cắt.
+        for i, s in enumerate(kept):
+            s["sentence_id"] = f"sent_{i + 1:03d}"
+        print(
+            f"[script_writer] Tổng narration ước tính {original_total:.1f}s vượt ngân sách "
+            f"~{budget:.1f}s (target {target_total_duration:.0f}s x{tolerance}) — đã cắt "
+            f"{len(to_drop)}/{original_count} câu (khớp cảnh yếu nhất) còn lại {total:.1f}s."
+        )
+    else:
+        print(
+            f"[script_writer] CẢNH BÁO: tổng narration ước tính {original_total:.1f}s vượt "
+            f"ngân sách ~{budget:.1f}s nhưng không còn câu nào có thể cắt bớt (chỉ có "
+            f"{original_count} câu, đã giữ câu đầu/cuối)."
+        )
+
+    return kept
 
 
 _CJK_PATTERN = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
@@ -917,6 +1047,7 @@ def calc_output_duration(
     buffer_after: float,
     min_dur: float,
     words_per_sec: float = 2.5,
+    safety_margin: float = 1.0,
 ) -> float:
     """
     Ước tính output_duration = thời lượng đọc + buffer, tối thiểu min_dur giây.
@@ -926,19 +1057,93 @@ def calc_output_duration(
     - Văn bản chữ Latin (tiếng Việt, tiếng Anh...): số ký tự Latin KHÔNG tỉ lệ
       với số âm tiết đọc ra (vd "không" có 5 ký tự nhưng chỉ 1 âm tiết), nên
       dùng số từ (word count) / words_per_sec thay vì đếm ký tự.
+    - safety_margin (0 < x <= 1, mặc định 1.0 = tắt): hệ số dự phòng nhân vào
+      chars_per_sec/words_per_sec TRƯỚC khi chia, tức là "giả vờ" giọng đọc
+      chậm hơn thực tế đo được một chút. TTS thực tế dao động ±10-20% tuỳ câu
+      (ngữ điệu, dấu câu, độ dài), nên nếu ước tính đúng bằng giá trị đo trung
+      vị, khoảng nửa số câu sẽ đọc CHẬM hơn ước tính -> lại tràn ra ngoài slot
+      -> lặp lại đúng lỗi khoảng lặng ban đầu ở quy mô nhỏ hơn. Dùng ví dụ
+      0.85 (mặc định processing.speech_safety_margin) nghĩa là luôn chừa dư
+      ~15% thời gian, che được phần lớn dao động thực tế mà không cần đo lại
+      từng câu (ý tưởng lấy từ speech_safety_margin trong bộ skill
+      video-recap-skills — xem NOTES-AI-DIRECTOR-VIDEO.md).
 
     Đây vẫn là ước tính dùng để xây dựng timeline TRƯỚC KHI tổng hợp TTS thật.
     Sau khi TTS chạy (tts.py), thời lượng thực tế được đo lại và ghi vào
     `tts_report.json` để người dùng đối chiếu nếu lệch nhiều.
     """
+    safety_margin = min(max(safety_margin, 0.1), 1.0)
     if _is_cjk_dominant(sentence):
         char_count = _count_narration_chars(sentence)
-        speech_dur = char_count / chars_per_sec
+        speech_dur = char_count / (chars_per_sec * safety_margin)
     else:
         clean = _PUNCT_PATTERN.sub('', sentence)
         word_count = len(clean.split())
-        speech_dur = word_count / words_per_sec
+        speech_dur = word_count / (words_per_sec * safety_margin)
     return max(speech_dur + buffer_after, min_dur)
+
+
+def compute_pacing_report(cfg, storyboard: dict[str, Any]) -> dict[str, Any]:
+    """
+    Chẩn đoán tốc độ từng clip — KHÔNG cắt/sửa gì, chỉ báo cáo (giống triết lý
+    "coverage is diagnostic, not a creative quota" trong bộ skill
+    video-recap-skills — xem NOTES-AI-DIRECTOR-VIDEO.md). Lý do cần tách riêng
+    khỏi việc ép tổng thời lượng: 1 video có thể có TỔNG thời lượng hợp lý
+    nhưng vẫn có VÀI clip riêng lẻ bị "gấp" (source quá ngắn so với lời bình,
+    render.py phải tua nhanh clip gốc) hoặc "lê thê" (source quá dài so với
+    lời bình, clip gốc bị chiếu chậm/kéo dài) — ép tổng không phát hiện được
+    lỗi cục bộ kiểu này.
+
+    speed = src_span / out_dur, ĐÚNG công thức render.render_clip dùng để
+    quyết định tốc độ tua nhanh/chậm clip gốc thật:
+      - speed > max_speed_ratio -> clip gốc bị tua nhanh quá mức (rushed/gấp)
+      - speed < min_speed_ratio -> clip gốc bị kéo chậm quá mức (dragging/lê thê)
+    """
+    max_speed_ratio = cfg.get("processing.max_speed_ratio", 4.0)
+    min_speed_ratio = cfg.get("processing.min_speed_ratio", 0.5)
+
+    flags = []
+    speeds = []
+    for clip in storyboard.get("timeline", []):
+        src = clip["source"]
+        out = clip["output"]
+        src_span = max(src["end"] - src["start"], 0.01)
+        out_dur = max(out["end"] - out["start"], 0.01)
+        speed = src_span / out_dur
+        speeds.append(speed)
+        if speed > max_speed_ratio:
+            flags.append({
+                "clip_id": clip["clip_id"],
+                "issue": "rushed",
+                "speed": round(speed, 2),
+                "detail": (
+                    f"Cảnh gốc dài {src_span:.1f}s nhưng lời bình chỉ {out_dur:.1f}s -> "
+                    f"clip gốc sẽ bị tua nhanh {speed:.1f}x (> max_speed_ratio={max_speed_ratio})."
+                ),
+            })
+        elif speed < min_speed_ratio:
+            flags.append({
+                "clip_id": clip["clip_id"],
+                "issue": "dragging",
+                "speed": round(speed, 2),
+                "detail": (
+                    f"Cảnh gốc chỉ dài {src_span:.1f}s nhưng lời bình cần {out_dur:.1f}s -> "
+                    f"clip gốc sẽ bị kéo chậm còn {speed:.2f}x (< min_speed_ratio={min_speed_ratio}), "
+                    "dễ trông lê thê/đơ hình."
+                ),
+            })
+
+    n = len(speeds) or 1
+    report = {
+        "clip_count": len(speeds),
+        "avg_speed": round(sum(speeds) / n, 2) if speeds else 0.0,
+        "rushed_count": sum(1 for f in flags if f["issue"] == "rushed"),
+        "dragging_count": sum(1 for f in flags if f["issue"] == "dragging"),
+        "max_speed_ratio": max_speed_ratio,
+        "min_speed_ratio": min_speed_ratio,
+        "flags": flags,
+    }
+    return report
 
 
 def build_storyboard(
@@ -955,6 +1160,7 @@ def build_storyboard(
     blocks_by_id = {b["scene_id"]: b for b in semantic_blocks}
     chars_per_sec = cfg.get("processing.chars_per_sec", 4.0)
     words_per_sec = cfg.get("processing.words_per_sec", 2.5)
+    safety_margin = cfg.get("processing.speech_safety_margin", 1.0)
     buffer_after = cfg.get("processing.buffer_after_speech", 0.1)
     min_dur = cfg.get("processing.min_clip_duration", 1.0)
 
@@ -969,7 +1175,9 @@ def build_storyboard(
         src_start = min(b["start"] for b in blocks)
         src_end = max(b["end"] for b in blocks)
 
-        out_dur = calc_output_duration(sent["sentence"], chars_per_sec, buffer_after, min_dur, words_per_sec)
+        out_dur = calc_output_duration(
+            sent["sentence"], chars_per_sec, buffer_after, min_dur, words_per_sec, safety_margin
+        )
         out_start = cursor
         out_end = cursor + out_dur
         cursor = out_end
@@ -1091,6 +1299,16 @@ def run_script_writer(
         print(f"[script_writer] Cảnh báo validate: {len(warnings)} clip cần xem lại.")
         for w in warnings:
             print(f"  - {w}")
+
+    pacing_report = compute_pacing_report(cfg, storyboard)
+    with open(pipeline_dir / "pacing_report.json", "w", encoding="utf-8") as f:
+        json.dump(pacing_report, f, ensure_ascii=False, indent=2)
+    if pacing_report["rushed_count"] or pacing_report["dragging_count"]:
+        print(
+            f"[script_writer] pacing_report.json: {pacing_report['rushed_count']} clip có thể bị GẤP, "
+            f"{pacing_report['dragging_count']} clip có thể bị LÊ THÊ trên tổng {pacing_report['clip_count']} "
+            "clip (chỉ chẩn đoán, không tự sửa — xem chi tiết trong file để chỉnh lại câu văn/scene nếu cần)."
+        )
 
     with open(pipeline_dir / "storyboard.json", "w", encoding="utf-8") as f:
         json.dump(storyboard, f, ensure_ascii=False, indent=2)

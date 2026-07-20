@@ -261,10 +261,46 @@ target_duration_sec = 180
 # non-interactive (đã tự chọn #1 ngay, không chờ).
 hook_selection_timeout_sec = 300   # 5 phút
 chars_per_sec = 4.0                # CJK characters per second
-words_per_sec = 2.5                 # Vietnamese/English words per second
+# ĐO THẬT từ tts_report.json (127 câu, engine="viterbox"): tổng 3761 từ /
+# 498.0s audio thật = ~7.55 từ/giây. Giá trị cũ (2.5) khiến pipeline ước tính
+# thời lượng đọc gấp ~3 lần thời lượng thật -> render.py giãn tốc độ clip gốc
+# ra để lấp đầy slot thời gian sai đó -> video dài lê thê + khoảng lặng giữa
+# các câu. Nếu đổi giọng/engine TTS khác, đo lại bằng tts_report.json rồi
+# cập nhật số này (không dùng chung 1 số cho mọi giọng).
+words_per_sec = 7.5                 # Vietnamese/English words per second
+# Hệ số dự phòng nhân vào chars_per_sec/words_per_sec khi ƯỚC TÍNH (không đổi
+# tốc độ TTS thật) — TTS thực tế dao động ±10-20% quanh giá trị đo trung vị
+# tuỳ câu, nên nếu cứ dùng đúng số đo trung vị, khoảng nửa số câu sẽ đọc CHẬM
+# hơn ước tính và lại tràn slot. 0.85 nghĩa là luôn chừa dư ~15% thời gian.
+# (Ý tưởng lấy từ speech_safety_margin trong bộ skill video-recap-skills.)
+speech_safety_margin = 0.85
 buffer_after_speech = 0.1
 min_clip_duration = 1.0
+# ---- Độ dài video: KHÔNG khoá cứng theo mặc định ----
+# "auto" (MẶC ĐỊNH, khuyên dùng): mỗi phim có lượng nội dung đáng kể để kể
+#   khác nhau — cảnh cao trào cần nhiều lời bình hơn cảnh chuyển tiếp. Ép mọi
+#   video về đúng 1 con số chung dễ cắt mất chỗ cần giữ hoặc giữ lại chỗ thừa
+#   một cách máy móc. Ở chế độ này, target_duration_sec chỉ còn là GỢI Ý MỀM
+#   dùng để chia ngân sách viết cho từng batch (không ép LLM viết đủ/thiếu
+#   cho khớp số), và KHÔNG có bước cắt cứng nào sau khi gộp toàn bộ narration
+#   — script_writer chỉ in ra tổng ước tính để bạn biết trước khi tốn TTS +
+#   render, xem log "[script_writer] processing.target_duration_mode='auto'".
+# "fixed": quay lại hành vi ép cứng — sau khi gộp mọi batch, nếu tổng vượt
+#   target_duration_sec * target_duration_tolerance, tự cắt bớt câu khớp cảnh
+#   yếu nhất (match_score thấp) cho tới khi vừa ngân sách, luôn giữ câu
+#   đầu/cuối. Chỉ nên bật nếu bạn thực sự cần khớp giới hạn thời lượng cứng
+#   (vd ràng buộc nền tảng đăng video, không phải để "video ngắn gọn hơn").
+target_duration_mode = "auto"       # target_duration_sec ở trên chỉ là gợi ý mềm khi mode="auto"
+target_duration_tolerance = 1.15    # chỉ dùng khi mode="fixed"
 max_speed_ratio = 4.0
+# MỚI: chặn dưới cho tốc độ clip gốc bị KÉO CHẬM để khớp lời bình dài — trước
+# đây không có chặn dưới, lời bình dài hơn nhiều so với cảnh gốc sẽ làm clip
+# bị kéo chậm không giới hạn (trông "lê thê", đơ hình). Dưới ngưỡng này,
+# render.py kẹp tốc độ lại và bù phần thời lượng còn thiếu bằng đông cứng
+# khung hình cuối, thay vì kéo chậm quá mức. Xem pacing_report.json (sinh ra
+# ở stage 'script') để biết trước clip nào sẽ bị kẹp tốc độ (gấp hoặc lê thê)
+# trước khi chạy TTS + render.
+min_speed_ratio = 0.5
 
 # ---- Checkpoint frequency ----
 # micro_checkpoint_interval: save checkpoint every N items (scenes/batches)
