@@ -1,7 +1,7 @@
 """
 tts.py — sinh giọng đọc (voiceover) cho từng câu trong storyboard.
 
-Hỗ trợ 2 engine, chọn qua `tts.engine` trong config.toml:
+Hỗ trợ 4 engine, chọn qua `tts.engine` trong config.toml:
   - "edge-tts" (mặc định): dùng edge-tts, không cần API key, không cần GPU.
     LƯU Ý: đây là API không chính thức của Microsoft, thỉnh thoảng bị chặn/
     rớt kết nối khi chạy từ IP datacenter (vd GitHub Actions) — lỗi
@@ -11,17 +11,33 @@ Hỗ trợ 2 engine, chọn qua `tts.engine` trong config.toml:
     nên không bị lỗi mạng như trên. Cần tải model (~3-4GB) lần đầu, chạy
     nhanh trên GPU và chậm hơn nhiều trên CPU. Chạy trong 1 venv RIÊNG
     (.viterbox_venv) vì package `viterbox` ghim version numpy/transformers
-    xung đột với requirements.txt chính của project.
+    xung đột với requirements.txt chính của project. Chất lượng giọng cao
+    nhất trong 4 engine (voice cloning), nhưng nặng/rắc rối nhất để vận hành.
+  - "piper": model TTS LOCAL cực nhẹ (VITS, ~15-60MB tuỳ giọng, chạy qua
+    ONNX Runtime CPU) — KHÔNG cần GPU, KHÔNG cần venv riêng, tốc độ gần như
+    real-time ngay cả trên CPU yếu. Chất lượng giọng ở mức "nghe hiểu tốt",
+    không tự nhiên/biểu cảm bằng Viterbox hay Gemini, nhưng đơn giản và ổn
+    định nhất trong 4 engine — phù hợp khi ưu tiên nhẹ/nhanh/không rắc rối
+    hơn là chất lượng giọng đỉnh cao. Không hỗ trợ voice cloning.
+  - "gemini": gọi Gemini TTS API của Google (cần `api.gemini_api_key` trong
+    config.toml) — chất lượng giọng rất tự nhiên, hỗ trợ tiếng Việt native,
+    KHÔNG cần GPU/venv riêng vì chỉ là API call. Chi phí cực rẻ (~0.01-0.05
+    USD cho cả 1 video ~10-15 phút, tính theo token audio output). Nhược
+    điểm: cần internet + API key, model đang ở trạng thái Preview (Google có
+    thể đổi giới hạn/giá bất cứ lúc nào), và có thể lệch tiến độ TTS nếu
+    request bị timeout/lỗi tạm thời (đã có retry tự động). Audio được gắn
+    watermark SynthID (không nghe thấy được, chỉ máy nhận diện).
 
 Mỗi câu narration được tổng hợp thành 1 file audio riêng, sau đó ghép lại
 thành 1 file audio tổng (voiceover.mp3) với timestamp đặt đúng theo
 `timeline[].output.start` trong storyboard.json — để đồng bộ với video render
 ở bước sau.
 
-edge-tts dùng asyncio (bọc lại bằng asyncio.run() để phần còn lại của
-pipeline, vốn đồng bộ, gọi bình thường). viterbox chạy đồng bộ qua subprocess
-(model AI, không hưởng lợi gì từ việc chạy song song nhiều luồng như network
-I/O của edge-tts).
+edge-tts và gemini dùng asyncio + semaphore (chạy song song nhiều câu, giới
+hạn số luồng đồng thời) vì đây là I/O mạng, hưởng lợi rõ từ việc chạy song
+song. viterbox chạy đồng bộ qua subprocess (model AI cục bộ, không hưởng lợi
+gì từ song song). piper chạy đồng bộ tuần tự (model ONNX cực nhẹ, mỗi câu
+chỉ mất một phần nhỏ của giây trên CPU nên không cần song song hoá).
 """
 
 from __future__ import annotations
@@ -29,6 +45,8 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -256,6 +274,236 @@ def _synthesize_all_viterbox(
     return paths  # type: ignore[return-value]
 
 
+def _ensure_piper_voice(cfg, voice_id: str) -> tuple[Path, Path]:
+    """
+    Đảm bảo 2 file (.onnx model + .onnx.json config) của giọng Piper `voice_id`
+    đã có sẵn cục bộ, tự tải về (từ HuggingFace, qua CLI `piper.download_voices`
+    có sẵn của package) nếu chưa có. Idempotent — lần chạy sau chỉ cần vài ms
+    để kiểm tra file đã tồn tại, không tải lại.
+    """
+    data_dir = cfg.get("tts.piper_data_dir")
+    if data_dir:
+        data_dir = cfg.resolve_path("tts.piper_data_dir")
+    else:
+        data_dir = cfg.resolve_path("paths.model_cache_dir") / "piper_voices"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = data_dir / f"{voice_id}.onnx"
+    config_path = data_dir / f"{voice_id}.onnx.json"
+    if model_path.exists() and config_path.exists():
+        return model_path, config_path
+
+    print(f"[tts] Tải giọng Piper '{voice_id}' về {data_dir} (chỉ cần 1 lần, "
+          f"file rất nhẹ — vài chục MB)...")
+    subprocess.run(
+        [sys.executable, "-m", "piper.download_voices", "--data-dir", str(data_dir), voice_id],
+        check=True,
+    )
+    if not (model_path.exists() and config_path.exists()):
+        raise RuntimeError(
+            f"[tts] Tải giọng Piper '{voice_id}' xong nhưng không thấy file mong đợi tại "
+            f"{model_path} / {config_path} — kiểm tra lại tên giọng (tts.piper_voice) có đúng "
+            f"định dạng '<mã_ngôn_ngữ>-<tên_giọng>-<chất_lượng>' không (vd 'vi_VN-vais1000-medium')."
+        )
+    return model_path, config_path
+
+
+def _synthesize_all_piper(
+    sentences: list[dict[str, Any]],
+    cfg,
+    out_dir: Path,
+    checkpoint_mgr=None,
+) -> list[Path]:
+    """
+    Sinh audio bằng backend 'piper': model TTS LOCAL cực nhẹ (VITS qua ONNX
+    Runtime CPU) — không cần GPU, không cần venv riêng, cài đặt/vận hành đơn
+    giản nhất trong các engine local. Đổi lại, giọng đọc không tự nhiên/biểu
+    cảm bằng Viterbox (Chatterbox fine-tune) hay Gemini TTS, nhưng đủ rõ ràng,
+    dễ nghe, tốc độ gần real-time ngay cả trên máy yếu.
+    """
+    from piper import PiperVoice  # import cục bộ: chỉ cần khi thực sự dùng engine này
+
+    voice_id = cfg.get("tts.piper_voice", "vi_VN-vais1000-medium")
+    model_path, config_path = _ensure_piper_voice(cfg, voice_id)
+
+    print(f"[tts] Đang load giọng Piper '{voice_id}'...")
+    voice = PiperVoice.load(str(model_path), config_path=str(config_path))
+    # 2 tên hàm khác nhau tuỳ version package piper-tts đang cài
+    # (bản mới: synthesize_wav, bản cũ hơn: synthesize) — dò để tương thích cả hai.
+    synth_fn = getattr(voice, "synthesize_wav", None) or getattr(voice, "synthesize", None)
+    if synth_fn is None:
+        raise RuntimeError(
+            "[tts] Package 'piper-tts' đang cài không có method synthesize_wav/synthesize "
+            "trên PiperVoice — có thể version quá cũ/mới không tương thích, thử "
+            "'pip install -U piper-tts'."
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done_ids: set[str] = set()
+    if checkpoint_mgr is not None:
+        done_ids = checkpoint_mgr.list_micro_done("tts")
+
+    total = len(sentences)
+    paths: list[Path] = []
+    done_count = 0
+    skipped = 0
+    print(f"[tts] Synthesizing {total} câu bằng Piper (local, CPU)...")
+    for sent in sentences:
+        clip_id = sent["clip_id"]
+        out_path = out_dir / f"{clip_id}.wav"
+
+        if clip_id in done_ids and out_path.exists():
+            paths.append(out_path)
+            done_count += 1
+            skipped += 1
+            print_progress_bar(done_count, total, prefix="[tts] synthesizing",
+                                suffix=f"{clip_id} (cached)")
+            continue
+
+        with wave.open(str(out_path), "wb") as wav_file:
+            synth_fn(sent["sentence"], wav_file)
+
+        paths.append(out_path)
+        done_count += 1
+        print_progress_bar(done_count, total, prefix="[tts] synthesizing", suffix=clip_id)
+
+        if checkpoint_mgr is not None:
+            checkpoint_mgr.save_micro("tts", clip_id, {
+                "clip_id": clip_id,
+                "audio_path": str(out_path),
+            })
+
+    if skipped:
+        print(f"[tts] Bỏ qua {skipped}/{total} câu đã tổng hợp sẵn (resume từ checkpoint).")
+    if checkpoint_mgr is not None:
+        checkpoint_mgr.flush_pending_syncs()
+
+    return paths
+
+
+def _gemini_call_sync(client, model: str, voice_name: str, input_text: str) -> bytes:
+    """Gọi Gemini TTS API (đồng bộ — chạy trong thread riêng qua asyncio.to_thread
+    ở nơi gọi, để không chặn event loop khi chạy song song nhiều câu)."""
+    import base64
+
+    interaction = client.interactions.create(
+        model=model,
+        input=input_text,
+        response_format={"type": "audio"},
+        generation_config={"speech_config": [{"voice": voice_name}]},
+    )
+    return base64.b64decode(interaction.output_audio.data)
+
+
+async def _gemini_synthesize_one_with_retry(
+    client, model: str, voice_name: str, style_prompt: str, text: str, out_path: Path,
+    max_retries: int = 3,
+) -> None:
+    """Sinh 1 file audio qua Gemini TTS, tự retry nếu gặp lỗi thoáng qua. Theo
+    tài liệu chính thức, model TTS của Gemini thỉnh thoảng trả về text token
+    thay vì audio token (~1 tỉ lệ nhỏ ngẫu nhiên request), gây lỗi 500 — nên
+    cần retry logic ở phía client thay vì coi đây là lỗi cố định."""
+    input_text = f"{style_prompt}\n\n{text}" if style_prompt else text
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            pcm_bytes = await asyncio.to_thread(_gemini_call_sync, client, model, voice_name, input_text)
+            # Gemini TTS trả PCM 16-bit mono 24kHz (theo tài liệu chính thức) -> đóng gói WAV.
+            with wave.open(str(out_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(pcm_bytes)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                await asyncio.sleep(2.0 * attempt)
+    raise RuntimeError(f"Gemini TTS thất bại sau {max_retries} lần thử: {last_err}") from last_err
+
+
+async def _synthesize_all_gemini(
+    sentences: list[dict[str, Any]],
+    cfg,
+    out_dir: Path,
+    checkpoint_mgr=None,
+) -> list[Path]:
+    """
+    Sinh audio bằng backend 'gemini': gọi Gemini TTS API của Google. Mỗi câu
+    được gửi thành 1 request riêng (khớp với khuyến nghị chính thức: chất
+    lượng audio có thể giảm dần với output dài hơn vài phút trong CÙNG 1
+    session -> chia nhỏ theo câu là cách an toàn nhất, và cũng khớp sẵn với
+    kiến trúc checkpoint/resume theo câu của pipeline này).
+    """
+    from google import genai  # import cục bộ: chỉ cần khi thực sự dùng engine này
+
+    api_key = cfg.get("api.gemini_api_key", "")
+    if not api_key or api_key.startswith("PASTE_"):
+        raise ValueError(
+            "Chưa cấu hình api.gemini_api_key trong config.toml. Lấy API key miễn phí tại "
+            "https://aistudio.google.com/apikey rồi điền vào config.toml (mục [api] "
+            "gemini_api_key)."
+        )
+    client = genai.Client(api_key=api_key)
+    model = cfg.get("tts.gemini_model", "gemini-2.5-flash-preview-tts")
+    voice_name = cfg.get("tts.gemini_voice", "Kore")
+    style_prompt = cfg.get("tts.gemini_style_prompt", "")
+    max_concurrency = cfg.get("tts.gemini_max_concurrency", 5)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total = len(sentences)
+    paths: list[Path | None] = [None] * total
+
+    done_ids: set[str] = set()
+    if checkpoint_mgr is not None:
+        done_ids = checkpoint_mgr.list_micro_done("tts")
+
+    # Concurrency thấp hơn hẳn edge-tts (40) vì đây là API TRẢ PHÍ có rate-limit
+    # thực sự (RPM giới hạn ở free tier/preview) -- mặc định 5 là mức an toàn,
+    # tăng lên nếu tài khoản có quota cao hơn.
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    progress = {"done": 0, "skipped": 0}
+
+    async def _run_one(idx: int, sent: dict[str, Any]) -> None:
+        clip_id = sent["clip_id"]
+        out_path = out_dir / f"{clip_id}.wav"
+
+        if clip_id in done_ids and out_path.exists():
+            paths[idx] = out_path
+            progress["done"] += 1
+            progress["skipped"] += 1
+            print_progress_bar(progress["done"], total, prefix="[tts] synthesizing",
+                                suffix=f"{clip_id} (cached)")
+            return
+
+        async with semaphore:
+            await _gemini_synthesize_one_with_retry(
+                client, model, voice_name, style_prompt, sent["sentence"], out_path
+            )
+
+        paths[idx] = out_path
+        progress["done"] += 1
+        print_progress_bar(progress["done"], total, prefix="[tts] synthesizing", suffix=clip_id)
+
+        if checkpoint_mgr is not None:
+            await asyncio.to_thread(checkpoint_mgr.save_micro, "tts", clip_id, {
+                "clip_id": clip_id,
+                "audio_path": str(out_path),
+            })
+
+    print(f"[tts] Synthesizing {total} câu bằng Gemini TTS (model={model}, voice={voice_name}, "
+          f"song song tối đa {max_concurrency} luồng)...")
+    await asyncio.gather(*(_run_one(i, sent) for i, sent in enumerate(sentences)))
+
+    if checkpoint_mgr is not None and sentences:
+        checkpoint_mgr.flush_pending_syncs()
+
+    if progress["skipped"]:
+        print(f"[tts] Bỏ qua {progress['skipped']}/{total} câu đã tổng hợp sẵn (resume từ checkpoint).")
+
+    return paths  # type: ignore[return-value]
+
+
 def _ffprobe_duration(path: Path) -> float:
     cmd = [
         "ffprobe", "-v", "error",
@@ -319,15 +567,21 @@ def run_tts(cfg, storyboard: dict[str, Any], checkpoint_mgr=None) -> dict[str, A
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
     engine = cfg.get("tts.engine", "edge-tts")
-    if engine not in ("edge-tts", "viterbox"):
+    if engine not in ("edge-tts", "viterbox", "piper", "gemini"):
         print(f"[tts] CẢNH BÁO: tts.engine = '{engine}' trong config.toml không hợp lệ "
-              f"(chỉ hỗ trợ 'edge-tts' hoặc 'viterbox') — dùng 'edge-tts' mặc định.")
+              f"(chỉ hỗ trợ 'edge-tts', 'viterbox', 'piper' hoặc 'gemini') — dùng 'edge-tts' mặc định.")
         engine = "edge-tts"
 
     sentences = storyboard["timeline"]
 
     if engine == "viterbox":
         clip_audio_paths = _synthesize_all_viterbox(sentences, cfg, tts_dir, checkpoint_mgr=checkpoint_mgr)
+    elif engine == "piper":
+        clip_audio_paths = _synthesize_all_piper(sentences, cfg, tts_dir, checkpoint_mgr=checkpoint_mgr)
+    elif engine == "gemini":
+        clip_audio_paths = asyncio.run(
+            _synthesize_all_gemini(sentences, cfg, tts_dir, checkpoint_mgr=checkpoint_mgr)
+        )
     else:
         voice = cfg.get("tts.voice", "vi-VN-HoangMinhNeural")
         rate = cfg.get("tts.rate", "+0%")

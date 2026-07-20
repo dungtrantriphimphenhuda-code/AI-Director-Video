@@ -56,6 +56,10 @@ openai>=1.50.0
 
 # --- TTS ---
 edge-tts>=6.1.19
+# "piper" backend (local, nhẹ, không cần GPU) — bundle sẵn onnxruntime.
+piper-tts>=1.3.0
+# "gemini" backend (cloud API) — Google Gen AI SDK.
+google-genai>=1.0.0
 
 # --- Data / subtitle utils ---
 pydantic>=2.12.0

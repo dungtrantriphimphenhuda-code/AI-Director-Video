@@ -12,6 +12,10 @@ cerebras_model = "zai-glm-4.7"
 cerebras_max_tokens = 8000
 cerebras_temperature = 0.8
 
+# Gemini API key (chỉ dùng khi tts.engine = "gemini") — lấy miễn phí tại
+# https://aistudio.google.com/apikey
+gemini_api_key = "PASTE_YOUR_GEMINI_API_KEY_HERE"
+
 # Hugging Face token — chỉ cần nếu Qwen3-VL-4B-Instruct hoặc model cần auth.
 hf_token = ""
 
