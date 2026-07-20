@@ -309,6 +309,15 @@ micro_checkpoint_interval = 1
 # auto_sync_cloud: auto sync to cloud storage (Tigris) after each checkpoint
 auto_sync_cloud = true
 
+[ci]
+# Đã xác nhận runner GitHub Actions (ubuntu-latest, 4 vCPU / 16GB RAM / đủ
+# disk sau khi dọn rác — xem cleanup.py và bước "Free disk space" trong
+# .github/workflows/run-pipeline.yml) đủ sức chạy trực tiếp các backend
+# "local" (script_backend, vision_backend, asr_backend ở trên) NGAY trên CI
+# — không cần tự động đổi sang API nữa. Đặt lại true bất kỳ lúc nào để quay
+# về chế độ an toàn cũ (tự đổi sang cerebras/mistral/whisper trên CI).
+force_lightweight_backends = false
+
 [reference]
 # Link video tham khảo (đối thủ) để AI đối chiếu đúng tên nhân vật/cốt
 # truyện khi viết narration — KHÔNG dùng để sao chép văn phong.

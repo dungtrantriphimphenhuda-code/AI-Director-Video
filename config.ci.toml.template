@@ -116,6 +116,14 @@ max_speed_ratio = 4.0
 micro_checkpoint_interval = 1
 auto_sync_cloud = true
 
+[ci]
+# Mặc định AN TOÀN cho template: true = luôn tự đổi backend "local"/"funasr"
+# sang API (cerebras/mistral/whisper) khi phát hiện chạy trong GitHub
+# Actions (xem config.py _apply_ci_safe_overrides). Đổi thành false CHỈ khi
+# đã tự xác nhận runner đủ disk/RAM để chạy local (xem hướng dẫn trong
+# README mục "Chạy tự động bằng GitHub Actions").
+force_lightweight_backends = true
+
 [reference]
 urls = []
 languages = ["vi", "en"]

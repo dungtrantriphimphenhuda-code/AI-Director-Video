@@ -24,6 +24,16 @@ import threading
 import time
 from typing import Any
 
+# Kết nối "mềm" tới progress_server.STATE (dashboard web xem tiến trình qua
+# cloudflared trên CI): import kiểu try/except để module này KHÔNG bắt buộc
+# phải có progress_server.py mới chạy được (vd môi trường cũ chưa cập nhật
+# file mới) — nếu import lỗi, mọi update bên dưới tự bỏ qua, không ảnh hưởng
+# gì tới pipeline chính.
+try:
+    from progress_server import STATE as _PROGRESS_STATE
+except Exception:
+    _PROGRESS_STATE = None  # type: ignore[assignment]
+
 
 def print_progress_bar(
     current: int,
@@ -191,6 +201,11 @@ class StepTracker:
         self.total = len(stage_names)
         self._stage_start = 0.0
         self._pipeline_start = time.time()
+        if _PROGRESS_STATE is not None:
+            try:
+                _PROGRESS_STATE.set_stages(stage_names)
+            except Exception:
+                pass
 
     def start(self, stage: str) -> None:
         idx = self.stage_names.index(stage) + 1
@@ -199,6 +214,11 @@ class StepTracker:
         print_progress_bar(idx - 1, self.total, prefix="[pipeline]", suffix=f"chuẩn bị: {stage}")
         print(f"[Bước {idx}/{self.total}] Bắt đầu: {stage}")
         print("=" * 70)
+        if _PROGRESS_STATE is not None:
+            try:
+                _PROGRESS_STATE.stage_started(stage, idx - 1, self.total)
+            except Exception:
+                pass
 
     def finish(self, stage: str, skipped: bool = False) -> None:
         idx = self.stage_names.index(stage) + 1
@@ -207,3 +227,8 @@ class StepTracker:
         print_progress_bar(idx, self.total, prefix="[pipeline]", suffix=f"hoàn tất: {stage} {tag}")
         total_elapsed = time.time() - self._pipeline_start
         print(f"[Bước {idx}/{self.total}] Xong: {stage} {tag} | tổng thời gian đã chạy: {total_elapsed / 60:.1f} phút\n")
+        if _PROGRESS_STATE is not None:
+            try:
+                _PROGRESS_STATE.stage_finished(stage, idx, self.total, elapsed, skipped=skipped)
+            except Exception:
+                pass

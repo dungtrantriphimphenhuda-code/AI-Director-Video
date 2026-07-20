@@ -37,6 +37,8 @@ from config import load_config  # noqa: E402
 from cloud_storage import get_cloud_storage_from_config  # noqa: E402
 from project_manager import ProjectManager  # noqa: E402
 from platform_utils import ensure_ffmpeg  # noqa: E402
+from cleanup import cleanup_workspace, print_disk_usage  # noqa: E402
+import progress_server  # noqa: E402
 import run as run_module  # noqa: E402  (tái dùng run_pipeline_on_project có sẵn)
 
 
@@ -56,9 +58,21 @@ def main() -> int:
     print("  AI DIRECTOR VIDEO — CI runner (GitHub Actions)")
     print("=" * 70)
 
+    # Dọn rác TRƯỚC khi tải/load bất kỳ model nào — quan trọng nhất khi
+    # ưu tiên backend "local" trên CI (ci.force_lightweight_backends=false),
+    # vì disk trống ban đầu quyết định model có tải xong được hay không.
+    print_disk_usage()
+    cleanup_workspace()
+
     ensure_ffmpeg()
     cfg = load_config("config.toml")
     cloud = get_cloud_storage_from_config(cfg)
+
+    # Mở dashboard tiến trình (server nội bộ) — bước riêng trong workflow sẽ
+    # dùng cloudflared để lấy link công khai tạm thời trỏ vào cổng này.
+    progress_http_server = progress_server.start_server(
+        port=int(cfg.get("ci.progress_port", 8787))
+    )
 
     if cloud is None or not getattr(cloud, "bucket_ready", False):
         print("[ci] CẢNH BÁO: cloud storage chưa sẵn sàng (kiểm tra secrets phần "
@@ -73,20 +87,42 @@ def main() -> int:
     if chosen is None:
         print("[ci] Không có project nào đang chờ xử lý (tất cả đã 'completed' "
               "hoặc chưa có project nào). Bỏ qua lần chạy này — không phải lỗi.")
+        progress_server.STATE.mark_done()
+        progress_http_server.shutdown()
         return 0
 
     project_id = chosen["project_id"]
     print(f"[ci] Đã chọn project: '{project_id}' "
           f"(status={chosen.get('status')}, last_modified={chosen.get('last_modified')})")
+    progress_server.STATE.project_id = project_id
 
     local_dir = pm.base_dir / project_id
     if not local_dir.exists() or chosen.get("source") == "cloud_only":
         ok = pm.sync_from_cloud(project_id)
         if not ok:
             print(f"[ci] LỖI: không tải được project '{project_id}' từ cloud.")
+            progress_server.STATE.mark_error(f"Không tải được project '{project_id}' từ cloud.")
+            progress_http_server.shutdown()
             return 1
 
-    run_module.run_pipeline_on_project(cfg, pm, project_id, cloud)
+    try:
+        run_module.run_pipeline_on_project(cfg, pm, project_id, cloud)
+    except Exception as exc:
+        progress_server.STATE.mark_error(str(exc))
+        raise
+    else:
+        progress_server.STATE.mark_done()
+    finally:
+        # Đoạn dọn rác THỨ HAI: sau khi chạy xong (dù thành công hay lỗi),
+        # dọn lại model cache dở dang/pip cache trước khi job kết thúc —
+        # giúp lần chạy kế tiếp (nếu runner tái sử dụng cache giữa các lần
+        # chạy qua actions/cache) không bị phình to dần theo thời gian.
+        print_disk_usage()
+        cleanup_workspace(model_cache_dir=cfg.resolve_path("paths.model_cache_dir"),
+                           projects_dir=cfg.resolve_path("paths.projects_dir"))
+        print_disk_usage()
+        progress_http_server.shutdown()
+
     return 0
 
 

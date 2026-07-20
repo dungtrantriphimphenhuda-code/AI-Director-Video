@@ -135,6 +135,23 @@ def _apply_ci_safe_overrides(data: dict[str, Any]) -> dict[str, Any]:
     if not _is_running_in_github_actions():
         return data
 
+    # [ci] force_lightweight_backends = false: người dùng đã tự xác nhận
+    # runner GitHub Actions (vd 4 vCPU / 16GB RAM / đủ disk) chịu được các
+    # backend "local" (tải + chạy model AI ngay trên máy) và MUỐN ưu tiên
+    # chạy local thay vì tự động đổi sang API — tắt HẲN override bên dưới.
+    # Mặc định (không có mục [ci] hoặc để true) vẫn giữ hành vi AN TOÀN cũ.
+    # Rủi ro khi tắt: nếu ước tính sai, job có thể bị runner huỷ giữa chừng
+    # vì hết disk/RAM — nhờ checkpoint gần real-time, lần chạy sau sẽ tự
+    # tiếp tục đúng chỗ dừng, không mất toàn bộ tiến độ.
+    ci_section = data.get("ci", {}) if isinstance(data.get("ci"), dict) else {}
+    if not ci_section.get("force_lightweight_backends", True):
+        print("[ci-config] 'ci.force_lightweight_backends = false' — GIỮ NGUYÊN "
+              "backend 'local' trên GitHub Actions theo lựa chọn của người dùng "
+              "(không tự đổi sang API). Nếu job bị huỷ giữa chừng vì hết disk/"
+              "RAM, chạy lại workflow (tự resume từ checkpoint) hoặc bật lại "
+              "true để quay về chế độ an toàn.")
+        return data
+
     def _get(dotted: str) -> Any:
         node: Any = data
         for part in dotted.split("."):

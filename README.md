@@ -300,6 +300,40 @@ Nếu không có project nào đang dang dở, workflow tự thoát êm — khô
 - **Mỗi lần sửa key**: sửa `config.toml` ở máy bạn rồi commit + push lại —
   workflow luôn dùng đúng file `config.toml` mới nhất trong repo.
 
+### Ưu tiên chạy backend "local" ngay trên CI
+
+Mặc định, `config.py` tự đổi các backend "local" (tốn disk/RAM) sang API khi
+phát hiện chạy trong GitHub Actions. Nếu bạn đã tự xác nhận runner đủ tài
+nguyên (vd 4 vCPU / 16GB RAM + disk đã dọn rác qua bước "Free disk space"),
+đặt trong `config.toml`:
+
+```toml
+[ci]
+force_lightweight_backends = false
+```
+
+Rủi ro: nếu ước tính sai, job có thể bị runner huỷ giữa chừng vì hết disk/
+RAM — nhờ checkpoint gần real-time, chạy lại workflow sẽ tự tiếp tục đúng
+chỗ dừng.
+
+### Theo dõi tiến trình trực tiếp (dashboard qua Cloudflare Quick Tunnel)
+
+Mỗi lần workflow chạy, nó tự mở 1 server tiến trình nội bộ (cổng 8787),
+dùng `cloudflared tunnel --url http://localhost:8787` để cấp 1 link công
+khai tạm thời (`https://xxxx.trycloudflare.com`) — **không cần tài khoản
+Cloudflare hay API token**. Link này xuất hiện trong tab **Actions** →
+lần chạy tương ứng → phần **Summary**, hiện % hoàn tất từng stage kèm dự
+đoán thời gian hoàn thành (ETA), tự làm mới mỗi 3 giây. Link chỉ tồn tại
+trong lúc job đang chạy.
+
+### Dọn rác tự động
+
+Workflow dọn rác 2 lần: (1) gỡ bớt công cụ cài sẵn không dùng tới trên
+runner (.NET, Android SDK, GHC...) để lấy lại disk trước khi tải model, và
+(2) sau khi pipeline chạy xong (`cleanup.py`), dọn `__pycache__`, pip
+cache, và file model tải dở dang — không đụng tới checkpoint hay output
+thật của project.
+
 ---
 
 ## File Structure
