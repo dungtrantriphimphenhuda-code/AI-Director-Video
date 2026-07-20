@@ -18,6 +18,10 @@ cerebras_api_key = "csk-vdmwee9e6kpmpyxdcfkvrxrcyhekh5w6vk39nwfc9wxmpkhk"
 cerebras_base_url = "https://api.cerebras.ai/v1"
 cerebras_model = "zai-glm-4.7"
 cerebras_max_tokens = 8000
+
+# Gemini API key (chỉ dùng khi tts.engine = "gemini") — lấy miễn phí tại
+# https://aistudio.google.com/apikey
+gemini_api_key = "AQ.Ab8RN6JiGH-dD48qhP3pHn8aP9X8PK5RsXBAk4CaYvvw787daw"
 cerebras_temperature = 0.8
 # zai-glm-4.7 là model REASONING (tự "suy nghĩ nội bộ" trước khi trả lời).
 # Với các lệnh gọi ở đây ta chỉ cần JSON có cấu trúc, không cần suy luận
@@ -34,6 +38,288 @@ cerebras_max_context_tokens = 8192
 # Số token output tối đa CHO MỖI BATCH narration (khác với cerebras_max_tokens
 # ở trên, vốn dùng cho các lệnh gọi 1-shot khác như generate_hooks). Để nhỏ
 # vì mỗi batch chỉ cần vài chục câu, dành phần lớn ngân sách token cho input
+# (scene blocks).
+cerebras_narration_batch_max_tokens = 2000
+
+# Hugging Face token (for Qwen3-VL-4B-Instruct or other models)
+hf_token = ""
+
+# Mistral API for vision analysis
+mistral_api_key = "WJkOtf6FxncjGsfLs2mujxew0ikNIDKX"
+mistral_base_url = "https://api.mistral.ai/v1"
+
+[tts]
+# "edge-tts": API không chính thức của Microsoft, hay bị chặn/rớt kết nối
+# (NoAudioReceived) khi chạy từ IP datacenter như GitHub Actions.
+# "viterbox": model TTS tiếng Việt LOCAL (fine-tune từ Chatterbox), không phụ
+# thuộc dịch vụ ngoài -> không bị lỗi mạng như trên. Chạy trong venv riêng
+# (.viterbox_venv, tự tạo lần đầu chạy) vì package viterbox ghim version
+# numpy/transformers xung đột với requirements.txt chính. Giọng tự nhiên
+# nhất, nhưng nặng/rắc rối nhất để vận hành (torch, model ~3-4GB, chậm nếu
+# không có GPU).
+# "piper": model TTS LOCAL cực nhẹ (ONNX, vài chục MB), chạy nhanh ngay cả
+# trên CPU yếu, không cần GPU/venv riêng -> đơn giản và ổn định nhất, đổi lại
+# giọng không tự nhiên/biểu cảm bằng viterbox hay gemini (nhưng vẫn rõ ràng,
+# dễ nghe hiểu).
+# "gemini": gọi Gemini TTS API của Google (cần điền api.gemini_api_key bên
+# dưới) -> giọng rất tự nhiên, không cần GPU, chi phí rất rẻ (~0.01-0.05 USD/
+# video), nhưng cần internet + API key và model đang ở bản Preview.
+engine = "piper"
+
+# ---- viterbox ----
+# null = tự phát hiện GPU (cuda nếu có, cpu nếu không). Ép "cpu" nếu muốn
+# chạy CPU dù có GPU (vd tiết kiệm VRAM cho tác vụ khác đang chạy song song).
+# viterbox_device = "cuda"
+viterbox_language = "vi"
+# Đường dẫn tới 1 file audio mẫu (3-10s, sạch, không nhiễu) nếu muốn voice
+# cloning theo giọng riêng. Để trống -> dùng giọng mặc định có sẵn của model.
+# viterbox_audio_prompt = "./my_voice_sample.wav"
+viterbox_exaggeration = 0.5
+viterbox_cfg_weight = 0.5
+viterbox_temperature = 0.8
+
+# ---- piper (local, nhẹ, dùng khi engine = "piper") ----
+# Định dạng tên giọng: "<mã_ngôn_ngữ>-<tên_giọng>-<chất_lượng>". Giọng tiếng
+# Việt tốt nhất hiện có trên Piper là vais1000 (chất lượng "medium") — các
+# lựa chọn khác: "vi_VN-25hours_single-low" (nhẹ hơn, chất lượng thấp hơn).
+# Danh sách đầy đủ mọi ngôn ngữ: https://github.com/rhasspy/piper/blob/master/VOICES.md
+# Model (~60MB) tự động tải về lần đầu chạy, lưu vào piper_data_dir bên dưới.
+piper_voice = "vi_VN-vais1000-medium"
+# Để trống -> tự lưu vào paths.model_cache_dir/piper_voices
+# piper_data_dir = "./model_cache/piper_voices"
+
+# ---- gemini (cloud API, dùng khi engine = "gemini") ----
+# Cần điền api.gemini_api_key ở mục [api] bên dưới (lấy miễn phí tại
+# https://aistudio.google.com/apikey).
+# Model TTS hiện có: "gemini-2.5-flash-preview-tts" (rẻ, nhanh — khuyến nghị),
+# "gemini-2.5-pro-preview-tts" (chất lượng cao hơn, đắt hơn),
+# "gemini-3.1-flash-tts-preview" (mới nhất, hỗ trợ audio tags [whispers] v.v.)
+gemini_model = "gemini-2.5-flash-preview-tts"
+# 30 giọng có sẵn, xem đầy đủ tại https://ai.google.dev/gemini-api/docs/speech-generation#voices
+# "Kore" (firm), "Puck" (upbeat), "Charon" (informative), "Aoede" (breezy)...
+gemini_voice = "Kore"
+# Prompt định hướng phong cách đọc (tuỳ chọn) — thêm vào TRƯỚC mỗi câu narration.
+# Để trống -> Gemini tự đọc câu văn bình thường, không có chỉ đạo phong cách.
+# gemini_style_prompt = "Đọc với giọng người dẫn chuyện phim tài liệu, trầm ấm, rõ ràng, tốc độ vừa phải:"
+# Số request song song cùng lúc. Đây là API TRẢ PHÍ có rate-limit thực sự
+# (RPM giới hạn, nhất là ở free tier/preview) nên để thấp hơn nhiều so với
+# edge-tts — tăng lên nếu tài khoản có quota cao hơn.
+gemini_max_concurrency = 5
+
+# ---- edge-tts (dự phòng, dùng khi engine = "edge-tts") ----
+# Vietnamese: "vi-VN-HoangMinhNeural", "vi-VN-NamMinhNeural"
+# English: "en-US-JennyNeural", "en-US-GuyNeural"
+voice = "vi-VN-HoangMinhNeural"
+rate = "+0%"
+volume = "+0%"
+pitch = "+0Hz"
+# Số câu tổng hợp song song cùng lúc. edge-tts ổn định, không rate-limit
+# cứng như API trả phí -> chạy song song thay vì tuần tự giúp nhanh hơn
+# nhiều lần với storyboard có nhiều câu. 40 là mức an toàn thực tế (đủ
+# nhanh, ít khi bị timeout/nghẽn do mở quá nhiều kết nối cùng lúc).
+max_concurrency = 40
+
+[processing]
+# ---- Script writing (hooks + narration), backend "local" ----
+# Model nhẹ/nhanh, viết tiếng Việt tốt, không cần API key/không rate limit.
+# Cùng cỡ (~4B) với model vision local (Qwen3-VL-4B) nên không tốn thêm
+# nhiều VRAM — model được giải phóng ngay sau khi stage 'script' xong.
+script_local_model_name = "Qwen/Qwen3-4B-Instruct-2507"
+script_local_device = "auto"          # auto | cuda | cpu | mps
+script_local_dtype = "bfloat16"       # bfloat16 | float16 | float32
+# Quantization để giảm VRAM/RAM cần thiết khi tải model:
+#   "auto" (MẶC ĐỊNH): trên GPU NVIDIA, tự bật 4-bit khi VRAM còn trống < 12GB
+#     lúc load (Colab T4 dùng chung, laptop GPU 6-8GB, v.v.), giữ full-precision
+#     nếu VRAM dư dả. Trên CPU, tự bật dynamic int8 quantization (không cần
+#     bitsandbytes/GPU) để giảm RAM và tăng tốc — luôn có lợi trên CPU nên bật
+#     mặc định. Trên MPS (Apple Silicon), giữ full-precision (chưa hỗ trợ quant).
+#   "4bit" | "8bit": ép luôn dùng quantization (GPU cần package `bitsandbytes`).
+#   "none": tắt hẳn, luôn tải full-precision theo script_local_dtype ở trên.
+# Ngoài ra, "ngân sách" context/batch (script_local_max_context_tokens bên dưới)
+# cũng được TỰ ĐỘNG giảm theo VRAM/RAM THẬT phát hiện lúc chạy (cả GPU lẫn CPU/
+# MPS) — con số cấu hình chỉ là TRẦN tối đa, không phải giá trị cố định — và
+# nếu vẫn hết VRAM/RAM giữa lúc sinh narration, pipeline tự chia đôi batch rồi
+# thử lại thay vì crash (xem LocalModelOOMError trong script_writer.py). Nhờ
+# các lớp bảo vệ này, không cần chỉnh tay theo từng loại phần cứng — script tự
+# thích ứng để CHẠY ĐƯỢC trên mọi loại máy (GPU mạnh/yếu, CPU, Apple Silicon).
+script_local_quantization = "auto"    # auto | 4bit | 8bit | none
+script_local_temperature = 0.7
+script_local_top_p = 0.8
+script_local_top_k = 20
+# LƯU Ý: KHÔNG còn giới hạn cứng số token output mỗi lần sinh (đã bỏ trần cũ
+# 3000). Qwen3-4B-Instruct-2507 có thể cần nhiều token cho phần suy luận nội
+# bộ trước khi viết JSON — cắt cứng ở 1 số nhỏ dễ làm output bị đứt giữa chừng.
+# Ngân sách output giờ được tính ĐỘNG trong lúc chạy = context thật của model
+# trừ đi phần input đã dùng (xem LocalScriptModel.chat trong script_writer.py)
+# — giới hạn duy nhất còn lại là khả năng thật của model, không phải cấu hình.
+# Key này chỉ còn được dùng làm "dự trù" khi tính script_local_max_context_tokens
+# bên dưới (chừa chỗ cho output khi chia batch scene ở INPUT), không phải trần
+# generate() thật sự nữa.
+script_local_max_new_tokens = 3000
+# Ngân sách token INPUT tối đa cho mỗi batch narration khi chạy local — có
+# thể để lớn hơn nhiều so với Cerebras (8192) vì không bị giới hạn context
+# ngặt nghèo, giúp ít batch hơn (nhanh hơn, mạch truyện liền lạc hơn vì model
+# thấy nhiều scene cùng lúc). Giảm nếu máy ít VRAM/RAM và gặp OOM.
+script_local_max_context_tokens = 24000
+
+# ---- ASR ----
+# "funasr" (MẶC ĐỊNH): dùng FunASR (Paraformer/SenseVoice) làm ASR chính.
+# "whisper": dùng thẳng faster-whisper, bỏ qua FunASR hoàn toàn.
+# Dù chọn giá trị nào, nếu asr_backend="funasr" mà bị lỗi ở bất kỳ bước nào
+# (thiếu package `funasr`, lỗi tải model, lỗi lúc transcribe...) thì asr.py
+# sẽ TỰ ĐỘNG fallback sang faster-whisper (log rõ lý do fallback) — không
+# cần sửa code, chỉ cần đổi asr_backend ở đây nếu muốn tắt hẳn FunASR.
+asr_backend = "funasr"
+
+# ---- ASR — FunASR (backend chính) ----
+# Model nhận dạng chính. "paraformer-zh" tối ưu cho tiếng Trung; nếu nội
+# dung/audio nguồn không phải tiếng Trung, đổi sang "iic/SenseVoiceSmall"
+# (đa ngôn ngữ: zh/en/ja/ko/yue, KHÔNG có tiếng Việt chính thức — với
+# asr_language="vi" như mặc định bên dưới, cân nhắc set asr_backend="whisper"
+# hoặc để asr_funasr_language="auto" và kiểm tra chất lượng output thực tế).
+asr_funasr_model = "paraformer-zh"
+asr_funasr_vad_model = "fsmn-vad"     # tách câu/đoạn im lặng trước khi nhận dạng
+asr_funasr_punc_model = "ct-punc"     # tự chèn dấu câu vào transcript
+asr_funasr_device = "auto"            # auto | cuda | cpu
+asr_funasr_language = "auto"          # auto | zh | en | ja | ko | yue (tuỳ model)
+
+# ---- ASR — faster-whisper (phương án dự phòng / asr_backend="whisper") ----
+asr_model_size = "small"          # tiny/base/small/medium/large-v3
+asr_device = "auto"               # auto | cuda | cpu
+asr_compute_type = "auto"         # auto | float16 | int8
+asr_language = "vi"               # language code, leave empty "" for auto-detect
+
+# ---- Vision ----
+# "local" (needs GPU) | "cerebras" | "mistral" | "moondream" (CPU-only, nhanh
+# nhất trong các lựa chọn không-GPU — dùng cho máy/CI không có GPU như
+# GitHub Actions runner; xem so sánh chi tiết trong docstring đầu vision.py)
+vision_backend = "moondream"
+cerebras_vision_model = "gemma-4-31b"
+cerebras_vision_max_images = 2
+cerebras_vision_rpm = 5
+
+# ---- Vision backend "mistral" ----
+mistral_vision_model = "mistral-large-latest"
+mistral_vision_max_images = 8
+mistral_vision_rpm = 15
+
+# ---- Vision backend "moondream" (Moondream2, ~1.9B, tối ưu CPU/edge) ----
+# Model nhỏ hơn Qwen3-VL-4B ~2x và được huấn luyện riêng để chạy nhanh trên
+# CPU, nên phù hợp cho GitHub Actions runner (không GPU). Đổi lại chỉ đọc
+# 1 keyframe đại diện/scene (không gộp cả vision_frames_per_scene ảnh như
+# backend "local"), nên chất lượng đọc cảnh (đặc biệt emotion/visual_intensity)
+# kém tinh tế hơn Qwen3-VL-4B hoặc backend API (cerebras/mistral).
+# revision: để trống "" nếu muốn luôn dùng bản mới nhất trên Hugging Face
+# (rủi ro: HF có thể đổi API khiến code lỗi); pin ngày cụ thể nếu cần ổn định.
+moondream_model_name = "vikhyatk/moondream2"
+moondream_revision = "2025-06-21"
+
+vision_model_name = "Qwen/Qwen3-VL-4B-Instruct"
+vision_device = "auto"
+vision_dtype = "float16"
+vision_max_new_tokens = 512
+vision_attn_implementation = "sdpa"
+# Đã tăng từ 4 -> 8: sau khi keyframe được resize (xem keyframe_max_side bên dưới),
+# mỗi ảnh dùng ít VRAM hơn nhiều lần nên có thể gộp nhiều scene/batch hơn mà
+# vẫn không OOM. Nếu máy vẫn OOM, hạ số này xuống trước (không cần đụng vào
+# keyframe_max_side).
+vision_batch_size = 8
+vision_frames_per_scene = 3
+
+# ---- Keyframe resize (fix OOM gốc + tăng tốc) ----
+# Trước đây keyframe được lưu ở đúng độ phân giải gốc của video (1080p/4K),
+# khiến Qwen3-VL (dynamic-resolution) sinh ra rất nhiều vision token và cần
+# hàng GiB VRAM chỉ cho 1 lần forward (kể cả batch_size=1). Resize cạnh dài
+# nhất về keyframe_max_side px trước khi lưu giúp giảm VRAM + tăng tốc
+# generate() đáng kể, trong khi 768px vẫn đủ để model đọc bố cục/cảnh/nhân
+# vật/chữ lớn. Có thể tăng lên 960-1024 nếu cần đọc chữ nhỏ chính xác hơn
+# và VRAM còn dư, hoặc hạ xuống 512-576 nếu vẫn OOM.
+keyframe_max_side = 768
+keyframe_jpeg_quality = 90
+
+# ---- Scene detection ----
+scene_threshold = 27.0
+min_scene_len_sec = 1.0
+
+# ---- Narration / storyboard ----
+narration_pov = "third_person"    # third_person | first_person
+content_type = "movie"            # movie | tv_drama | anime | short_drama | foreign_language_commentary
+genre = "drama"
+# Ngôn ngữ VIẾT KỊCH BẢN/NARRATION (hook + toàn bộ câu thoại dẫn chuyện),
+# dùng tên ngôn ngữ đầy đủ (LLM hiểu rõ hơn mã ISO) — PHẢI khớp với giọng
+# đọc TTS ở mục [tts] voice bên trên, nếu không giọng Việt sẽ đọc văn bản
+# tiếng Anh (hoặc ngược lại), nghe rất lạc quẻ. Trước đây key này không tồn
+# tại -> script_writer.py chỉ "đoán" ngôn ngữ theo plot_summary do người
+# dùng nhập, nếu bỏ trống (Enter) sẽ mặc định về tiếng Anh dù voice đã để
+# tiếng Việt.
+narration_language = "Vietnamese"
+target_duration_sec = 180
+# Sau khi sinh 10 hook mở đầu (đã sắp xếp theo tiềm năng viral, xem
+# script_writer.generate_hooks), nếu chạy tương tác nhưng người dùng KHÔNG
+# nhập số thứ tự trong vòng bấy nhiêu giây, tự động chọn hook #1 (tiềm năng
+# cao nhất) — giống hệt như nhấn Enter. Không ảnh hưởng chế độ
+# non-interactive (đã tự chọn #1 ngay, không chờ).
+hook_selection_timeout_sec = 300   # 5 phút
+chars_per_sec = 4.0                # CJK characters per second
+words_per_sec = 2.5                 # Vietnamese/English words per second
+buffer_after_speech = 0.1
+min_clip_duration = 1.0
+max_speed_ratio = 4.0
+
+# ---- Checkpoint frequency ----
+# micro_checkpoint_interval: save checkpoint every N items (scenes/batches)
+# Lower = more frequent (near real-time). Default: 1 = every item.
+micro_checkpoint_interval = 1
+# auto_sync_cloud: auto sync to cloud storage (Tigris) after each checkpoint
+auto_sync_cloud = true
+
+[reference]
+# Link video tham khảo (đối thủ) để AI đối chiếu đúng tên nhân vật/cốt
+# truyện khi viết narration — KHÔNG dùng để sao chép văn phong.
+urls = []
+languages = ["vi", "en"]
+max_chars_per_video = 6000
+use_ytdlp_fallback = true
+ytdlp_cookies_from_browser = ""
+
+[paths]
+input_video = "./input/source.mp4"
+output_dir = "./output"
+checkpoint_dir = "./checkpoints"
+model_cache_dir = "./model_cache"
+# projects_dir: where all projects are stored
+projects_dir = "./projects"
+
+[cloud]
+# Đang dùng Tigris (https://www.tigrisdata.com). Mục này (và code trong
+# cloud_storage.py) hoàn toàn generic cho mọi provider tương thích S3 —
+# chỉ cần đổi giá trị bên dưới là dùng được provider khác (Filebase, AWS S3,
+# Cloudflare R2, ...), không cần sửa code.
+# Access key (Tigris)
+access_key = "tid_dNkBsQSwjrwPNURmxVXaAVHbTti_atxKRhbAFLgzidMEUBhiNs"
+# Secret key (Tigris)
+secret_key = "tsec_tSF2U_bmM6qAkMneeR848yOrZUzVvYAcfVFTBbL7iJIdhcoI1SJGO_kW1AthM4gqqhW9CY"
+# Bucket name
+bucket_name = "ai-director-video-quynh"
+# Tigris S3 endpoint (dùng ngoài mạng Fly.io; nếu chạy trên Fly.io có thể
+# đổi sang "https://fly.storage.tigris.dev" để giảm độ trễ)
+endpoint_url = "https://t3.storage.dev"
+# Tigris dùng region "auto" (không phải vùng AWS cụ thể như Filebase)
+region_name = "auto"
+# Tigris BẮT BUỘC dùng virtual-hosted style (bucket nằm trong hostname),
+# khác với Filebase dùng "path". Đặt sai sẽ gây lỗi 403/404 khó hiểu.
+addressing_style = "virtual"
+# Enable/disable cloud sync
+enabled = true
+
+[project]
+# Default project settings
+auto_project_scan = true
+show_project_menu_on_start = true
+# Auto-save interval in seconds (0 = after each stage)
+auto_save_interval = 0
+# Max cloud sync retry attempts
+cloud_sync_retries = 3
 # (scene blocks).
 cerebras_narration_batch_max_tokens = 2000
 
