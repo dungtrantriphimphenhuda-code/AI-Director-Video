@@ -38,6 +38,7 @@ from __future__ import annotations
 import base64
 import gc
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,69 @@ def _patch_modelscope_dynamic_module_hijack() -> None:
             mod.get_class_from_dynamic_module = original_fn
 
 
+_INTENSITY_WORD_MAP = {
+    "none": 0.0,
+    "very low": 0.1,
+    "low": 0.2,
+    "mild": 0.2,
+    "moderate": 0.5,
+    "medium": 0.5,
+    "average": 0.5,
+    "high": 0.8,
+    "very high": 0.9,
+    "intense": 0.9,
+    "extreme": 1.0,
+    "maximum": 1.0,
+}
+
+
+def _safe_visual_intensity(raw: Any) -> float:
+    """Chuyển giá trị visual_intensity trả về từ model sang float một cách an toàn.
+
+    Model vision (đặc biệt các backend nhẹ như moondream) đôi khi không tuân
+    theo schema và trả về một câu mô tả (vd: "Moderate, capturing the hand's
+    interaction with the note.") thay vì một con số. Trước đây code ép
+    float() trực tiếp lên giá trị này khiến cả pipeline crash giữa chừng.
+    Hàm này cố gắng khôi phục một con số hợp lý, và nếu không thể thì trả
+    về 0.0 thay vì raise lỗi.
+    """
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except (TypeError, ValueError):
+            return 0.0
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return 0.0
+        # Thử parse trực tiếp trước (trường hợp là "0.7" hoặc "0,7")
+        try:
+            return max(0.0, min(1.0, float(text.replace(",", "."))))
+        except ValueError:
+            pass
+        # Thử tìm số thực đầu tiên trong chuỗi (vd: "khoảng 0.6 do...")
+        match = re.search(r"[-+]?\d*\.?\d+", text)
+        if match:
+            try:
+                val = float(match.group())
+                # Nếu model trả thang điểm 0-10 thay vì 0-1, chuẩn hoá lại
+                if val > 1.0:
+                    val = val / 10.0 if val <= 10.0 else 1.0
+                return max(0.0, min(1.0, val))
+            except ValueError:
+                pass
+        # Thử map các từ mô tả cường độ (không phân biệt hoa/thường)
+        lowered = text.lower()
+        for word, val in _INTENSITY_WORD_MAP.items():
+            if word in lowered:
+                return val
+        # Không nhận diện được — fallback an toàn, không crash pipeline
+        return 0.0
+    return 0.0
+
+
 def _parse_json_response(text: str) -> dict[str, Any]:
     """Cố gắng parse JSON từ output model; nếu lỗi, trả về kết quả rỗng an toàn."""
     text = text.strip()
@@ -133,7 +197,7 @@ def _parse_json_response(text: str) -> dict[str, Any]:
         "actions": data.get("actions", []),
         "emotion": data.get("emotion", ""),
         "shot_type": data.get("shot_type", ""),
-        "visual_intensity": float(data.get("visual_intensity", 0.0) or 0.0),
+        "visual_intensity": _safe_visual_intensity(data.get("visual_intensity", 0.0)),
         "tags": data.get("tags", []),
     }
 
@@ -657,7 +721,13 @@ class MoondreamVisionAnalyzer:
             print(f"[vision] Lỗi Moondream2 cho {scene_id}: {e}")
             return _empty_result(scene_id, reason="model_error")
 
-        parsed = _parse_json_response(output_text)
+        try:
+            parsed = _parse_json_response(output_text)
+        except Exception as e:
+            # An toàn: một scene lỗi không được phép làm sập cả pipeline khi
+            # đã chạy hàng chục/hàng trăm scene trước đó tốn nhiều thời gian.
+            print(f"[vision] Lỗi parse JSON cho {scene_id}: {e}")
+            return _empty_result(scene_id, reason="parse_error")
         parsed["scene_id"] = scene_id
         return parsed
 
