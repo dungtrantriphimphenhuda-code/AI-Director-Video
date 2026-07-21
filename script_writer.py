@@ -469,13 +469,23 @@ def generate_hooks(cfg, task_config: dict[str, Any], director_brief: str = "") -
 
 
 def _estimate_tokens(text: str) -> int:
-    """Ước lượng SỐ TOKEN của 1 chuỗi (chars // 3).
+    """Ước lượng SỐ TOKEN của 1 chuỗi (chars // 2).
 
     Đây là ước lượng CỐ Ý cao hơn thực tế (an toàn) để chia batch — không
     dùng cho mục đích tính tiền/giới hạn chính xác của API, chỉ để quyết
-    định lúc nào cần cắt batch trước khi gọi Cerebras.
+    định lúc nào cần cắt batch trước khi gọi Cerebras/model local.
+
+    BUGFIX: trước đây dùng chars // 3, nhưng với văn bản tiếng Việt có dấu,
+    tokenizer thực tế (vd Gemma GGUF) thường tách MỖI ký tự có dấu thành
+    hơn 1 token (khác tiếng Anh thuần ASCII) — chars // 3 vì vậy ước lượng
+    THẤP hơn số token thật khá nhiều, khiến 1 batch narration bị nhồi nhiều
+    scene hơn mức ngân sách output còn lại có thể xử lý -> model sinh JSON
+    bị cắt cụt giữa chừng (json.JSONDecodeError: Unterminated string /
+    Expecting ',' delimiter) làm crash cả pipeline ở stage narration_batch_N.
+    Đổi sang chars // 2 để bám sát hơn số token thật, chia batch nhỏ hơn
+    (an toàn hơn, đổi lấy nhiều lệnh gọi model hơn một chút).
     """
-    return max(1, len(text) // 3)
+    return max(1, len(text) // 2)
 
 
 def _batch_semantic_blocks(
@@ -680,10 +690,15 @@ def generate_narration(
         prior_story_so_far: str, label: str, depth: int = 0,
     ) -> list[dict[str, Any]]:
         """Sinh narration cho 1 nhóm block, TỰ CHIA ĐÔI và thử lại nếu backend
-        local báo hết VRAM/RAM (LocalModelOOMError) — cho phép pipeline chạy
-        xong trên phần cứng yếu (thay vì crash) bằng cách xử lý từng phần nhỏ
-        hơn, đổi lấy nhiều lệnh gọi model hơn. Chỉ backend local mới OOM theo
-        kiểu này (cerebras là API từ xa, không tốn VRAM máy mình)."""
+        local báo hết VRAM/RAM (LocalModelOOMError) HOẶC nếu JSON trả về bị
+        cắt cụt/hỏng sau khi đã retry ở _chat_json (ScriptWriterJSONError) —
+        cho phép pipeline chạy xong trên phần cứng yếu / batch quá lớn (thay
+        vì crash) bằng cách xử lý từng phần nhỏ hơn, đổi lấy nhiều lệnh gọi
+        model hơn. Trường hợp JSON bị cắt hay gặp khi _estimate_tokens ước
+        lượng thấp hơn số token thật (vd narration tiếng Việt có dấu, tokenizer
+        Gemma tách nhiều token/ký tự hơn ước lượng chars//3) khiến 1 batch có
+        input dài hơn dự kiến, ăn hết ngân sách output còn lại (xem BUGFIX
+        trong NOTES-AI-DIRECTOR-VIDEO.md)."""
         system_prompt = _narration_system_prompt(narration_language, is_continuation=not is_first)
         user_prompt = _narration_user_prompt(
             task_config, hook, director_brief, blocks,
@@ -694,17 +709,26 @@ def generate_narration(
                 cfg, system_prompt, user_prompt, stage=f"narration_batch_{label}",
                 max_tokens_override=batch_output_tokens,
             )
-        except LocalModelOOMError as e:
+        except (LocalModelOOMError, ScriptWriterJSONError) as e:
+            is_oom = isinstance(e, LocalModelOOMError)
+            reason = "hết VRAM/RAM" if is_oom else "JSON bị cắt/hỏng (không đủ ngân sách token output)"
             if len(blocks) <= 1 or depth >= 6:
+                if is_oom:
+                    raise ScriptWriterJSONError(
+                        f"Stage 'script': hết VRAM/RAM khi sinh narration cho batch '{label}' dù đã "
+                        f"chia nhỏ tới {len(blocks)} scene/lần gọi (depth={depth}). Máy này có thể không "
+                        f"đủ tài nguyên để chạy model local — thử đổi 'api.script_backend = \"cerebras\"' "
+                        f"trong config.toml, hoặc dùng model nhẹ hơn qua "
+                        f"'processing.script_local_model_name'."
+                    ) from e
                 raise ScriptWriterJSONError(
-                    f"Stage 'script': hết VRAM/RAM khi sinh narration cho batch '{label}' dù đã "
-                    f"chia nhỏ tới {len(blocks)} scene/lần gọi (depth={depth}). Máy này có thể không "
-                    f"đủ tài nguyên để chạy model local — thử đổi 'api.script_backend = \"cerebras\"' "
-                    f"trong config.toml, hoặc dùng model nhẹ hơn qua "
-                    f"'processing.script_local_model_name'."
+                    f"Stage 'script': JSON liên tục bị cắt/hỏng khi sinh narration cho batch '{label}' "
+                    f"dù đã chia nhỏ tới {len(blocks)} scene/lần gọi (depth={depth}). Thử tăng "
+                    f"'processing.script_local_max_context_tokens' (n_ctx) trong config.toml nếu máy còn "
+                    f"RAM trống, hoặc giảm 'processing.script_local_max_new_tokens'."
                 ) from e
             mid = len(blocks) // 2
-            print(f"[script_writer] CẢNH BÁO: hết VRAM/RAM ở batch '{label}' ({len(blocks)} scene) — "
+            print(f"[script_writer] CẢNH BÁO: {reason} ở batch '{label}' ({len(blocks)} scene) — "
                   f"chia đôi và thử lại (sẽ tốn thêm lệnh gọi model nhưng tránh crash pipeline).")
             first_half, second_half = blocks[:mid], blocks[mid:]
             share = mid / len(blocks)
