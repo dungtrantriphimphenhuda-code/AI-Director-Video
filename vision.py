@@ -46,6 +46,7 @@ from typing import Any
 from PIL import Image
 
 from platform_utils import resolve_torch_device
+from platform_utils import PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE as _EARLY_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE
 from progress_utils import print_progress_bar
 
 VISION_SYSTEM_PROMPT = (
@@ -60,10 +61,60 @@ VISION_SYSTEM_PROMPT = (
 )
 
 
+_MODELSCOPE_HIJACK_SUBMODULES = [
+    "transformers.dynamic_module_utils",
+    "transformers.models.auto.configuration_auto",
+    "transformers.models.auto.auto_factory",
+    "transformers.models.auto.tokenization_auto",
+    "transformers.models.auto.image_processing_auto",
+    "transformers.models.auto.feature_extraction_auto",
+    "transformers.models.auto.processing_auto",
+]
+
+# Bản "sạch" (chưa bị modelscope monkeypatch) của get_class_from_dynamic_module.
+#
+# ƯU TIÊN dùng bản đã chụp SẴN từ `platform_utils` (chụp ngay lúc
+# `from platform_utils import ...` chạy ở GẦN DÒNG ĐẦU TIÊN của run.py —
+# TRƯỚC CẢ khi `ensure_python_packages()` gọi `__import__("funasr")`, chính
+# là nơi funasr kéo theo modelscope và modelscope monkeypatch transformers
+# ngay lúc import). Đây là bản THẬT SỰ đáng tin cậy.
+#
+# Bản chụp NGAY TẠI ĐÂY (lúc `import vision`) chỉ dùng làm dự phòng: `import
+# vision` chỉ xảy ra rất muộn trong run_pipeline_on_project() — SAU KHI
+# ensure_python_packages() đã chạy xong từ lâu — nên nếu tới đây transformers
+# đã bị vá rồi, bản chụp này chụp nhầm luôn bản đã hỏng (đúng lý do bản vá
+# trước không có tác dụng trên Colab, dù ASR stage có bị bỏ qua vì checkpoint
+# hay không — vì __import__("funasr") vẫn luôn chạy ở bước kiểm tra dependency).
+try:
+    import transformers.dynamic_module_utils as _dmu_pristine
+    _LATE_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE = _dmu_pristine.get_class_from_dynamic_module
+except Exception:
+    _LATE_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE = None
+
+_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE = (
+    _EARLY_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE or _LATE_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE
+)
+
+
+def _rebind_get_class_from_dynamic_module(original_fn) -> None:
+    """Rebind `get_class_from_dynamic_module` về đúng `original_fn` ở mọi nơi
+    modelscope có thể đã ghi đè (kể cả `transformers.dynamic_module_utils`
+    gốc, không chỉ các submodule auto.*)."""
+    import importlib
+    for mod_name in _MODELSCOPE_HIJACK_SUBMODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        if getattr(mod, "get_class_from_dynamic_module", None) is not original_fn:
+            mod.get_class_from_dynamic_module = original_fn
+
+
 def _patch_modelscope_dynamic_module_hijack() -> None:
     """Sửa lỗi: funasr (ASR stage, chạy TRƯỚC vision stage) import modelscope,
     và modelscope tự động monkeypatch `get_class_from_dynamic_module` bên trong
-    nhiều submodule `transformers.models.auto.*` để mọi model tải qua
+    nhiều submodule `transformers.models.auto.*` (và đôi khi cả bản gốc trong
+    `transformers.dynamic_module_utils`) để mọi model tải qua
     `trust_remote_code=True` (kể cả model KHÔNG liên quan gì tới modelscope,
     như Moondream2/Qwen3-VL ở đây) bị "hijack" sang tải qua ModelScope Hub
     thay vì Hugging Face Hub.
@@ -74,36 +125,35 @@ def _patch_modelscope_dynamic_module_hijack() -> None:
         TypeError: 'tuple' object does not support item assignment
     (modelscope/utils/hf_util/patcher.py, hàm get_class_from_dynamic_module)
 
-    Cách sửa: modelscope patch bằng cách rebind lại tên
-    `get_class_from_dynamic_module` trong namespace của TỪNG submodule auto
-    (configuration_auto, auto_factory, tokenization_auto, ...) — bản gốc,
-    chưa bị sửa, vẫn còn nguyên trong `transformers.dynamic_module_utils`.
-    Nên chỉ cần rebind lại các tên đó về đúng hàm gốc là vô hiệu hoá hijack,
-    không cần biết chi tiết modelscope patch thế nào / không cần gỡ cài đặt
-    modelscope (vẫn cần cho FunASR ở ASR stage).
+    Cách sửa: rebind lại `get_class_from_dynamic_module` (ở TỪNG submodule
+    auto.* lẫn ở chính `transformers.dynamic_module_utils`) về bản ĐÃ CHỤP
+    SẴN từ lúc `import vision` (biến `_PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE`
+    ở trên) — không đọc lại "bản gốc" tại thời điểm này nữa, vì tại đây có
+    thể đã quá trễ (modelscope có thể đã patch xong). Kèm 1 lưới an toàn phụ
+    vá thẳng vào modelscope nếu module đó đã được import. Không cần biết chi
+    tiết modelscope patch thế nào / không cần gỡ cài đặt modelscope (vẫn cần
+    cho FunASR ở ASR stage).
     """
-    try:
-        import transformers.dynamic_module_utils as _dmu
-        original_fn = _dmu.get_class_from_dynamic_module
-    except Exception:
-        return  # transformers chưa cài / đổi cấu trúc module -> bỏ qua, không crash pipeline
-
-    submodule_names = [
-        "transformers.models.auto.configuration_auto",
-        "transformers.models.auto.auto_factory",
-        "transformers.models.auto.tokenization_auto",
-        "transformers.models.auto.image_processing_auto",
-        "transformers.models.auto.feature_extraction_auto",
-        "transformers.models.auto.processing_auto",
-    ]
-    import importlib
-    for mod_name in submodule_names:
+    original_fn = _PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE
+    if original_fn is None:
         try:
-            mod = importlib.import_module(mod_name)
+            import transformers.dynamic_module_utils as _dmu
+            original_fn = _dmu.get_class_from_dynamic_module
         except Exception:
-            continue
-        if getattr(mod, "get_class_from_dynamic_module", None) is not original_fn:
-            mod.get_class_from_dynamic_module = original_fn
+            return  # transformers chưa cài / đổi cấu trúc module -> bỏ qua, không crash pipeline
+
+    _rebind_get_class_from_dynamic_module(original_fn)
+
+    # Lưới an toàn phụ: nếu modelscope đã được import, vá LUÔN thẳng vào
+    # module gốc giữ hàm lỗi (modelscope.utils.hf_util.patcher) — phòng
+    # trường hợp có nơi nào đó gọi thẳng vào tham chiếu của module này thay
+    # vì qua tên đã rebind ở transformers.*.
+    try:
+        import modelscope.utils.hf_util.patcher as _ms_patcher
+        if getattr(_ms_patcher, "get_class_from_dynamic_module", None) is not original_fn:
+            _ms_patcher.get_class_from_dynamic_module = original_fn
+    except Exception:
+        pass
 
 
 _INTENSITY_WORD_MAP = {
@@ -656,8 +706,25 @@ class MoondreamVisionAnalyzer:
         if self.revision:
             kwargs["revision"] = self.revision
 
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, **kwargs)
+        def _load_with_modelscope_retry(loader, *args, **kw):
+            """Gọi `loader(*args, **kw)`; nếu dính đúng lỗi hijack của
+            modelscope (TypeError trên tuple), vá lại 1 lần nữa (bao gồm cả
+            lưới an toàn vá thẳng modelscope) rồi thử lại ĐÚNG 1 lần — tránh
+            crash toàn bộ pipeline vì 1 lỗi tương thích thư viện bên ngoài,
+            không phải lỗi logic của chính vision.py."""
+            try:
+                return loader(*args, **kw)
+            except TypeError as e:
+                msg = str(e)
+                if "tuple" not in msg or "item assignment" not in msg:
+                    raise
+                print("[vision] Phát hiện ModelScope vẫn hijack from_pretrained "
+                      "(TypeError tuple) dù đã vá — vá sâu thêm lần nữa rồi thử lại...")
+                _patch_modelscope_dynamic_module_hijack()
+                return loader(*args, **kw)
+
+        self.model = _load_with_modelscope_retry(AutoModelForCausalLM.from_pretrained, self.model_name, **kwargs)
+        self.tokenizer = _load_with_modelscope_retry(AutoTokenizer.from_pretrained, self.model_name, **kwargs)
         if self.device in ("cpu", "mps"):
             self.model.to(self.device)
         self.model.eval()

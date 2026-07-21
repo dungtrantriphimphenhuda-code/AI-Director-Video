@@ -14,6 +14,28 @@ import shutil
 import subprocess
 import sys
 
+# Chụp lại "bản sạch" (chưa bị modelscope monkeypatch) của
+# transformers.dynamic_module_utils.get_class_from_dynamic_module CÀNG SỚM
+# CÀNG TỐT trong vòng đời tiến trình.
+#
+# Lý do đặt ở ĐÂY (platform_utils.py) thay vì ở vision.py: run.py import
+# module này (`from platform_utils import ensure_ffmpeg, ensure_rclone`)
+# GẦN NHƯ NGAY DÒNG ĐẦU TIÊN — trước cả khi `ensure_python_packages()` được
+# gọi (hàm đó mới thực sự làm `__import__("funasr")` để kiểm tra dependency,
+# và funasr kéo theo modelscope, modelscope monkeypatch transformers ngay
+# lúc import). Nếu chờ tới lúc `import vision` (chỉ xảy ra rất muộn, bên
+# trong run_pipeline_on_project(), sau khi ensure_python_packages() đã chạy
+# xong từ lâu) mới chụp, thì transformers ĐÃ BỊ modelscope vá từ trước đó —
+# chụp lại lúc này chỉ chụp được bản đã hỏng, khiến mọi nỗ lực "un-patch"
+# sau đó ở vision.py vô nghĩa (đây chính là lý do bản vá trước không ăn
+# thua trên Colab — funasr được __import__() ở bước kiểm tra dependency dù
+# ASR stage có bị bỏ qua vì checkpoint hay không).
+try:
+    import transformers.dynamic_module_utils as _dmu_early
+    PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE = _dmu_early.get_class_from_dynamic_module
+except Exception:
+    PRISTINE_GET_CLASS_FROM_DYNAMIC_MODULE = None
+
 
 
 
