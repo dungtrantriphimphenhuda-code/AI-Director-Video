@@ -121,46 +121,44 @@ max_concurrency = 40
 
 [processing]
 # ---- Script writing (hooks + narration), backend "local" ----
-# Model nhẹ/nhanh, viết tiếng Việt tốt, không cần API key/không rate limit.
-# Cùng cỡ (~4B) với model vision local (Qwen3-VL-4B) nên không tốn thêm
-# nhiều VRAM — model được giải phóng ngay sau khi stage 'script' xong.
-script_local_model_name = "Qwen/Qwen3-4B-Instruct-2507"
-script_local_device = "auto"          # auto | cuda | cpu | mps
-script_local_dtype = "bfloat16"       # bfloat16 | float16 | float32
-# Quantization để giảm VRAM/RAM cần thiết khi tải model:
-#   "auto" (MẶC ĐỊNH): trên GPU NVIDIA, tự bật 4-bit khi VRAM còn trống < 12GB
-#     lúc load (Colab T4 dùng chung, laptop GPU 6-8GB, v.v.), giữ full-precision
-#     nếu VRAM dư dả. Trên CPU, tự bật dynamic int8 quantization (không cần
-#     bitsandbytes/GPU) để giảm RAM và tăng tốc — luôn có lợi trên CPU nên bật
-#     mặc định. Trên MPS (Apple Silicon), giữ full-precision (chưa hỗ trợ quant).
-#   "4bit" | "8bit": ép luôn dùng quantization (GPU cần package `bitsandbytes`).
-#   "none": tắt hẳn, luôn tải full-precision theo script_local_dtype ở trên.
-# Ngoài ra, "ngân sách" context/batch (script_local_max_context_tokens bên dưới)
-# cũng được TỰ ĐỘNG giảm theo VRAM/RAM THẬT phát hiện lúc chạy (cả GPU lẫn CPU/
-# MPS) — con số cấu hình chỉ là TRẦN tối đa, không phải giá trị cố định — và
-# nếu vẫn hết VRAM/RAM giữa lúc sinh narration, pipeline tự chia đôi batch rồi
-# thử lại thay vì crash (xem LocalModelOOMError trong script_writer.py). Nhờ
-# các lớp bảo vệ này, không cần chỉnh tay theo từng loại phần cứng — script tự
-# thích ứng để CHẠY ĐƯỢC trên mọi loại máy (GPU mạnh/yếu, CPU, Apple Silicon).
-script_local_quantization = "auto"    # auto | 4bit | 8bit | none
+# ĐÃ ĐỔI từ Qwen3-4B-Instruct-2507 (transformers, float32-trên-CPU + giả lập
+# 8bit bằng bitsandbytes) sang Gemma 4 E4B bản QAT (Quantization-Aware
+# Training), chạy qua llama.cpp (định dạng GGUF) thay vì transformers.
+# Lý do đổi: bản Qwen cũ khi chạy CPU (vd runner GitHub Actions không có GPU)
+# tự fallback dtype 'bfloat16' -> 'float32' — model 4B ở float32 tốn RIÊNG
+# phần trọng số ~16GB, xấp xỉ/vượt hẳn RAM runner miễn phí -> runner bị đói
+# RAM -> lỗi "The hosted runner lost communication with the server" (xem
+# NOTES-AI-DIRECTOR-VIDEO.md). GGUF QAT nhẹ hơn hẳn: cùng chất lượng gần như
+# bfloat16 gốc nhưng E4B chỉ cần ~5GB RAM, chạy ổn định trên runner 4-core/
+# 16GB (repo public) lẫn máy yếu hơn.
+# Repo Hugging Face public, KHÔNG bị gate (khác repo gốc google/gemma-4-*),
+# nên KHÔNG cần điền api.hf_token.
+script_local_gguf_repo = "unsloth/gemma-4-E4B-it-qat-GGUF"
+# Glob pattern khớp tên file .gguf trong repo trên — đổi sang "*Q8_0*.gguf"
+# nếu muốn chất lượng cao hơn (đổi lại nặng hơn, cần nhiều RAM hơn), hoặc trỏ
+# sang repo/model size khác (vd "unsloth/gemma-4-12B-it-qat-GGUF" nếu máy có
+# nhiều RAM hơn và muốn model mạnh hơn).
+script_local_gguf_filename = "*UD-Q4_K_XL*.gguf"
+script_local_device = "auto"          # auto | cuda | cpu
+# Số layer đẩy lên GPU (chỉ có tác dụng nếu llama-cpp-python được build kèm
+# hỗ trợ CUDA/Metal và device thật sự có GPU) — -1 = đẩy toàn bộ layer lên
+# GPU nếu có, 0 = chạy thuần CPU. "auto" tự chọn theo device phát hiện được.
+script_local_gpu_layers = "auto"      # auto | số nguyên (vd -1, 0, 20)
 script_local_temperature = 0.7
 script_local_top_p = 0.8
 script_local_top_k = 20
-# LƯU Ý: KHÔNG còn giới hạn cứng số token output mỗi lần sinh (đã bỏ trần cũ
-# 3000). Qwen3-4B-Instruct-2507 có thể cần nhiều token cho phần suy luận nội
-# bộ trước khi viết JSON — cắt cứng ở 1 số nhỏ dễ làm output bị đứt giữa chừng.
-# Ngân sách output giờ được tính ĐỘNG trong lúc chạy = context thật của model
-# trừ đi phần input đã dùng (xem LocalScriptModel.chat trong script_writer.py)
-# — giới hạn duy nhất còn lại là khả năng thật của model, không phải cấu hình.
-# Key này chỉ còn được dùng làm "dự trù" khi tính script_local_max_context_tokens
-# bên dưới (chừa chỗ cho output khi chia batch scene ở INPUT), không phải trần
-# generate() thật sự nữa.
+# Ngân sách token OUTPUT tối đa cho mỗi lần sinh (hooks hoặc 1 batch
+# narration) — không cắt cứng như trước; đây là TRẦN trên, ngân sách thật sự
+# vẫn được tính động = n_ctx của model trừ input đã dùng (xem
+# LocalScriptModel.chat trong script_writer.py).
 script_local_max_new_tokens = 3000
-# Ngân sách token INPUT tối đa cho mỗi batch narration khi chạy local — có
-# thể để lớn hơn nhiều so với Cerebras (8192) vì không bị giới hạn context
-# ngặt nghèo, giúp ít batch hơn (nhanh hơn, mạch truyện liền lạc hơn vì model
-# thấy nhiều scene cùng lúc). Giảm nếu máy ít VRAM/RAM và gặp OOM.
-script_local_max_context_tokens = 24000
+# n_ctx (context window) cấp cho llama.cpp lúc load model — KHÁC với bản
+# transformers cũ (context window "vốn có" của model, không cần cấp trước):
+# ở llama.cpp, RAM cho KV cache được CẤP PHÁT SẴN ngay khi tải model theo
+# đúng con số này, nên để quá cao dễ OOM ngay lúc LOAD thay vì lúc generate.
+# Giá trị dưới đây được tự động giảm nếu RAM trống lúc load thấp (xem
+# LocalScriptModel.load) — con số ở config chỉ là TRẦN tối đa mong muốn.
+script_local_max_context_tokens = 16000
 
 # ---- ASR ----
 # "funasr" (MẶC ĐỊNH): dùng FunASR (Paraformer/SenseVoice) làm ASR chính.

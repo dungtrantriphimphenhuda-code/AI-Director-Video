@@ -42,9 +42,9 @@ def _get_client(cfg) -> OpenAI:
 
 def _chat(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str:
     """Gọi LLM để viết kịch bản — dispatch theo `api.script_backend`:
-      - "local" (MẶC ĐỊNH): model nhẹ chạy ngay trên máy/Colab (Qwen3-4B-Instruct-2507),
-        không cần API key, không giới hạn context nhỏ, không có rủi ro "nuốt hết
-        token vào suy luận nội bộ" như model reasoning.
+      - "local" (MẶC ĐỊNH): model nhẹ chạy ngay trên máy/Colab (Gemma 4 E4B QAT,
+        GGUF qua llama.cpp), không cần API key, không giới hạn context nhỏ,
+        không có rủi ro "nuốt hết token vào suy luận nội bộ" như model reasoning.
       - "cerebras": dùng lại API Cerebras như trước (đổi `api.script_backend =
         "cerebras"` trong config.toml nếu muốn quay lại).
     """
@@ -114,336 +114,218 @@ def _chat_cerebras(cfg, system_prompt: str, user_prompt: str, max_tokens: int | 
 
 
 # =============================================================================
-# Backend "local" — model nhẹ chạy ngay trên máy (mặc định Qwen3-4B-Instruct-2507)
+# Backend "local" — model nhẹ chạy ngay trên máy (mặc định Gemma 4 E4B QAT,
+# GGUF qua llama.cpp — trước đây là Qwen3-4B-Instruct-2507 qua transformers)
 # =============================================================================
 #
 # Lý do đổi mặc định sang local: model reasoning qua Cerebras (zai-glm-4.7) có
 # thể "nuốt" hết ngân sách token vào suy luận nội bộ trước khi kịp viết JSON
 # (xem BUGFIX trong _chat_cerebras), đặc biệt dễ xảy ra khi narration được
 # chia thành nhiều batch nhỏ cho phim dài. Chạy local tránh hẳn vấn đề đó
-# (không cần API key, không rate limit, không giới hạn context 8K khắt khe),
-# đổi lại cần GPU/CPU đủ mạnh để tải + chạy model — Qwen3-4B-Instruct-2507
-# được chọn vì nhẹ (~4B tham số, cùng cỡ với Qwen3-VL-4B đã dùng cho vision
-# nên không tốn thêm VRAM đáng kể), nhanh, và viết văn tiếng Việt tốt. Muốn
-# quay lại Cerebras: đổi `api.script_backend = "cerebras"` trong config.toml.
+# (không cần API key, không rate limit, không giới hạn context 8K khắt khe).
+#
+# Lý do đổi từ Qwen3-4B-Instruct-2507 (transformers) sang Gemma 4 E4B QAT
+# (GGUF, llama.cpp): bản Qwen khi chạy CPU (vd runner GitHub Actions không có
+# GPU) tự fallback dtype 'bfloat16' -> 'float32' — riêng trọng số model 4B ở
+# float32 đã tốn ~16GB RAM, khiến runner CI bị đói RAM giữa lúc load model và
+# lỗi "The hosted runner lost communication with the server" (xem
+# NOTES-AI-DIRECTOR-VIDEO.md). GGUF QAT của Gemma 4 E4B nhẹ hơn hẳn (~5GB RAM,
+# chất lượng gần bằng bfloat16 gốc nhờ Quantization-Aware Training) và chạy
+# qua llama.cpp — vốn được tối ưu cho CPU tốt hơn nhiều so với việc "giả lập"
+# 8bit bằng bitsandbytes trên transformers. Muốn quay lại Cerebras: đổi
+# `api.script_backend = "cerebras"` trong config.toml.
 
 _local_model_singleton: "LocalScriptModel | None" = None
 
-# VRAM còn trống (GB) dưới ngưỡng này -> tự động bật quantization 4-bit thay
-# vì tải full bf16/fp16. Qwen3-4B ở bf16 tốn ~8GB CHỈ để load weights, chưa
-# tính KV cache cho input dài (batch narration có thể ~20K token) -> trên GPU
-# < ~12GB free (Colab T4 dùng chung, laptop GPU, v.v.) rất dễ OOM giữa generate().
-# Ở 4-bit, cùng model chỉ tốn ~2.5-3GB weights, để dư nhiều VRAM hơn cho KV cache.
-_LOW_VRAM_QUANT_THRESHOLD_GB = 12.0
-# Dưới ngưỡng này (kể cả sau khi đã quant 4-bit) coi như không đủ để chạy GPU
-# ổn định cho ngữ cảnh dài -> rơi về CPU thay vì cố chạy rồi OOM giữa chừng.
-_MIN_USABLE_CUDA_VRAM_GB = 3.5
-
 
 class LocalModelOOMError(RuntimeError):
-    """Hết VRAM/RAM khi sinh text bằng model local, kể cả sau khi đã thử giảm
-    max_new_tokens + dọn cache. Caller (vd generate_narration) có thể bắt lỗi
+    """Hết RAM/context khi sinh text bằng model local, kể cả sau khi đã thử
+    giảm max_tokens + dọn cache. Caller (vd generate_narration) có thể bắt lỗi
     này để CHIA NHỎ batch input rồi thử lại, thay vì để cả pipeline crash."""
 
 
 def _is_oom_error(exc: BaseException) -> bool:
     text = str(exc).lower()
-    return "out of memory" in text or "cuda error" in text or isinstance(exc, MemoryError)
+    return (
+        "out of memory" in text
+        or "cuda error" in text
+        or "failed to allocate" in text
+        or ("exceed" in text and ("context" in text or "n_ctx" in text))
+        or "n_ctx" in text
+        or isinstance(exc, MemoryError)
+    )
 
 
 class LocalScriptModel:
-    """Bọc model + tokenizer chạy local, load một lần và tái sử dụng cho toàn
-    bộ hooks + mọi batch narration của 1 project (tránh load lại model nặng
-    cho mỗi lệnh gọi).
+    """Bọc model GGUF (llama.cpp) + cấu hình, load một lần và tái sử dụng cho
+    toàn bộ hooks + mọi batch narration của 1 project (tránh load lại model
+    nặng cho mỗi lệnh gọi).
 
-    Tự thích ứng với phần cứng thật đang chạy (thay vì giả định luôn có GPU
-    lớn rảnh VRAM): phát hiện VRAM còn trống lúc load() để tự chọn quantization
-    4-bit khi cần, và tính ra "ngân sách" context token an toàn thay vì dùng
-    1 con số cố định cho mọi máy (xem `recommended_max_context_tokens`)."""
+    ĐÃ ĐỔI từ Qwen3-4B-Instruct-2507 (transformers + bitsandbytes) sang
+    Gemma 4 E4B bản QAT (Quantization-Aware Training), repack GGUF bởi
+    Unsloth, chạy qua llama-cpp-python thay vì transformers — nhẹ hơn nhiều
+    trên CPU (không có bước "giả lập" 8bit tốn RAM của bitsandbytes, vốn là
+    nguyên nhân runner GitHub Actions từng bị OOM/"lost communication with
+    the server" khi load Qwen3-4B ở float32 — xem NOTES-AI-DIRECTOR-VIDEO.md).
+    Repo Hugging Face public, không gate, không cần hf_token.
+
+    Khác biệt quan trọng so với bản transformers cũ: llama.cpp CẤP PHÁT SẴN
+    RAM cho KV cache ngay lúc load model theo đúng n_ctx được truyền vào (thay
+    vì context là thuộc tính "vốn có" của model, có thể hỏi thêm lúc chạy) —
+    nên n_ctx phải được ước lượng AN TOÀN dựa trên RAM trống lúc load, chứ
+    không thể "xin thêm" giữa chừng như trước.
+    """
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.model_name = cfg.get("processing.script_local_model_name", "Qwen/Qwen3-4B-Instruct-2507")
+        self.repo_id = cfg.get("processing.script_local_gguf_repo", "unsloth/gemma-4-E4B-it-qat-GGUF")
+        self.filename = cfg.get("processing.script_local_gguf_filename", "*UD-Q4_K_XL*.gguf")
         self.cache_dir = str(cfg.resolve_path("paths.model_cache_dir"))
         self.device = resolve_torch_device(cfg.get("processing.script_local_device", "auto"))
-        self.dtype_name = cfg.get("processing.script_local_dtype", "bfloat16")
-        self.quantization = cfg.get("processing.script_local_quantization", "auto")  # auto|4bit|8bit|none
+        self.gpu_layers_cfg = cfg.get("processing.script_local_gpu_layers", "auto")
         self.temperature = cfg.get("processing.script_local_temperature", 0.7)
         self.top_p = cfg.get("processing.script_local_top_p", 0.8)
         self.top_k = cfg.get("processing.script_local_top_k", 20)
+        self.configured_max_context_tokens = cfg.get("processing.script_local_max_context_tokens", 16000)
         self.model = None
-        self.tokenizer = None
-        self._torch = None
-        self._quantized = False
-        self._free_vram_gb_at_load: float | None = None
-        self._free_ram_gb_at_load: float | None = None
-        self.max_model_context: int = 32768  # ghi đè thật sau khi load(), đây chỉ là giá trị an toàn mặc định
+        self.max_model_context: int = 4096  # ghi đè thật sau khi load(), đây chỉ là giá trị an toàn mặc định
 
     def load(self) -> None:
-        # Giảm phân mảnh VRAM (nguyên nhân phổ biến gây OOM dù tổng VRAM còn
-        # đủ) — phải set TRƯỚC khi CUDA context được khởi tạo (trước import torch).
         import os
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # Tải nhanh hơn qua Hugging Face Hub (package hf_transfer đã thêm vào
+        # requirements.txt) — không ảnh hưởng gì nếu package thiếu, chỉ tắt
+        # tính năng tăng tốc tải.
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
-        import torch  # lazy import: chỉ cần khi thực sự dùng backend "local"
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self._torch = torch
-        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}.get(
-            self.dtype_name, torch.bfloat16
-        )
+        from llama_cpp import Llama
 
-        from platform_utils import get_free_vram_gb, get_free_ram_gb
-        free_vram_gb = get_free_vram_gb() if self.device == "cuda" else None
-        self._free_vram_gb_at_load = free_vram_gb
-        self._free_ram_gb_at_load = get_free_ram_gb()
+        from platform_utils import get_free_ram_gb
+        free_ram_gb = get_free_ram_gb()
 
-        if self.device == "cpu":
-            # Dùng hết số core CPU thật có cho phép nhân ma trận trong generate()
-            # — mặc định PyTorch đôi khi chỉ dùng 1 nửa core, chậm không cần thiết.
-            import os as _os
-            cpu_count = _os.cpu_count() or 4
-            torch.set_num_threads(max(1, cpu_count))
-            # bfloat16/float16 không có kernel CPU nhanh trên nhiều máy (chạy
-            # được nhưng chậm hơn hẳn float32 do thiếu tối ưu BLAS) — ép về
-            # float32 trên CPU bất kể cấu hình, và dynamic-quantize sau khi
-            # tải (xem bên dưới) để bù lại phần RAM/tốc độ.
-            if self.dtype_name != "float32":
-                print(f"[script_writer] Chạy CPU: đổi dtype '{self.dtype_name}' -> 'float32' "
-                      f"(nhanh/ổn định hơn trên CPU với hầu hết BLAS backend hiện tại).")
-            dtype = torch.float32
+        # n_ctx (context window) PHẢI cấp TRƯỚC khi load vì llama.cpp cấp phát
+        # RAM cho KV cache ngay lúc tạo model theo đúng con số này — để quá
+        # cao dễ OOM ngay LÚC LOAD (khác lỗi lúc generate). Tự giảm n_ctx nếu
+        # RAM trống lúc load thấp, giống tinh thần "tự thích ứng phần cứng"
+        # của bản Qwen/transformers cũ nhưng áp dụng SỚM hơn (trước khi load
+        # thay vì trong lúc chat()).
+        n_ctx = self.configured_max_context_tokens
+        if free_ram_gb is not None:
+            if free_ram_gb < 6.0:
+                n_ctx = min(n_ctx, 4096)
+            elif free_ram_gb < 10.0:
+                n_ctx = min(n_ctx, 8192)
+            if n_ctx < self.configured_max_context_tokens:
+                print(f"[script_writer] RAM trống lúc load chỉ ~{free_ram_gb:.1f}GB — giảm n_ctx "
+                      f"từ {self.configured_max_context_tokens} xuống {n_ctx} để tránh OOM lúc tải model.")
 
-        # Nếu GPU được chọn nhưng gần như không còn VRAM trống -> rơi về CPU
-        # ngay từ đầu thay vì cố tải rồi OOM (vd GPU đang bị stage khác giữ chỗ).
-        if self.device == "cuda" and free_vram_gb is not None and free_vram_gb < _MIN_USABLE_CUDA_VRAM_GB:
-            print(f"[script_writer] CẢNH BÁO: GPU chỉ còn ~{free_vram_gb:.1f}GB VRAM trống "
-                  f"(< {_MIN_USABLE_CUDA_VRAM_GB}GB) — chuyển sang chạy CPU để tránh OOM.")
-            self.device = "cpu"
+        n_gpu_layers = self.gpu_layers_cfg
+        if n_gpu_layers == "auto":
+            n_gpu_layers = -1 if self.device == "cuda" else 0
 
-        want_quant = self.quantization
-        if want_quant == "auto":
-            if self.device == "cuda":
-                want_quant = (
-                    "4bit" if free_vram_gb is not None and free_vram_gb < _LOW_VRAM_QUANT_THRESHOLD_GB
-                    else "none"
-                )
-            elif self.device == "cpu":
-                # CPU luôn được lợi từ dynamic int8 quantization (nhanh hơn +
-                # ít RAM hơn, không cần GPU/bitsandbytes) nên bật mặc định.
-                want_quant = "8bit"
-            else:
-                want_quant = "none"
-
-        quant_config = None
-        if want_quant in ("4bit", "8bit") and self.device == "cuda":
-            try:
-                from transformers import BitsAndBytesConfig
-                if want_quant == "4bit":
-                    quant_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=dtype,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_use_double_quant=True,
-                    )
-                else:
-                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
-                self._quantized = True
-            except ImportError:
-                print("[script_writer] CẢNH BÁO: thiếu package 'bitsandbytes' nên không bật được "
-                      f"quantization {want_quant} dù VRAM thấp (~{free_vram_gb and round(free_vram_gb, 1)}GB "
-                      "trống) — cài `pip install bitsandbytes` để giảm VRAM cần thiết. Vẫn tiếp tục "
-                      "chạy full-precision, có thể chậm/OOM trên GPU nhỏ.")
-                want_quant = "none"
-
-        vram_note = f", VRAM trống ~{free_vram_gb:.1f}GB" if free_vram_gb is not None else ""
-        print(f"[script_writer] Loading local model {self.model_name} on {self.device} "
-              f"({self.dtype_name}, quantization={want_quant}{vram_note})... (lần đầu sẽ tải model; "
-              f"log tải % / tốc độ của huggingface_hub sẽ hiện ngay bên dưới)")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name, cache_dir=self.cache_dir, trust_remote_code=True,
-        )
+        n_threads = os.cpu_count() or 4
+        ram_note = f", RAM trống ~{free_ram_gb:.1f}GB" if free_ram_gb is not None else ""
+        print(f"[script_writer] Loading local model (GGUF) {self.repo_id}:{self.filename} "
+              f"(n_ctx={n_ctx}, n_gpu_layers={n_gpu_layers}, n_threads={n_threads}{ram_note})... "
+              f"(lần đầu sẽ tải model; log tải % của huggingface_hub sẽ hiện ngay bên dưới)")
 
         load_kwargs = dict(
+            repo_id=self.repo_id,
+            filename=self.filename,
             cache_dir=self.cache_dir,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers,
+            n_threads=n_threads,
+            verbose=False,
         )
-        if quant_config is not None:
-            load_kwargs["quantization_config"] = quant_config
-            load_kwargs["device_map"] = "auto"
-        else:
-            load_kwargs["device_map"] = "auto" if self.device == "cuda" else None
-            load_kwargs["dtype"] = dtype
-
         try:
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
-        except TypeError:
-            # transformers cũ hơn không nhận kwarg 'dtype' (chỉ có 'torch_dtype').
-            load_kwargs.pop("dtype", None)
-            if quant_config is None:
-                load_kwargs["torch_dtype"] = dtype
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
-        except self._torch.cuda.OutOfMemoryError:
-            # Không đủ VRAM ngay cả để LOAD model (khác với OOM lúc generate).
-            # Thử lần cuối bằng CPU thay vì crash toàn bộ pipeline.
-            print("[script_writer] CẢNH BÁO: OOM khi tải model lên GPU — thử lại trên CPU.")
-            gc.collect()
-            self._torch.cuda.empty_cache()
-            self.device = "cpu"
-            load_kwargs.pop("device_map", None)
-            load_kwargs.pop("quantization_config", None)
-            load_kwargs["dtype"] = dtype
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **load_kwargs)
+            self.model = Llama.from_pretrained(**load_kwargs)
+        except Exception as e:
+            if not _is_oom_error(e) or n_ctx <= 2048:
+                raise
+            # RAM lúc load có thể đã bị stage trước (vision, ASR) giữ chỗ
+            # nhiều hơn ước tính (get_free_ram_gb chỉ đo tại 1 thời điểm) —
+            # thử lại 1 lần với n_ctx tối thiểu trước khi bó tay hẳn, giống
+            # tinh thần "giảm rồi thử lại" của bản Qwen/transformers cũ.
+            fallback_ctx = 2048
+            print(f"[script_writer] CẢNH BÁO: lỗi khi tải model với n_ctx={n_ctx} ({e}) — "
+                  f"thử lại với n_ctx={fallback_ctx}.")
+            load_kwargs["n_ctx"] = fallback_ctx
+            self.model = Llama.from_pretrained(**load_kwargs)
+            n_ctx = fallback_ctx
 
-        if self.device in ("cpu", "mps") and quant_config is None:
-            self.model.to(self.device)
-
-        if want_quant in ("8bit", "4bit") and self.device == "cpu":
-            try:
-                import torch.quantization as tq
-                self.model = tq.quantize_dynamic(self.model, {torch.nn.Linear}, dtype=torch.qint8)
-                self._quantized = True
-                print("[script_writer] Đã áp dụng dynamic int8 quantization cho CPU "
-                      "(giảm RAM cần thiết, tăng tốc matmul).")
-            except Exception as e:
-                print(f"[script_writer] CẢNH BÁO: không bật được CPU quantization ({e}) — "
-                      "chạy tiếp float32 đầy đủ, có thể chậm hơn trên máy yếu.")
-
-        self.model.eval()
-
-        # Ngưỡng context THẬT của model (không phải con số áp đặt từ config) —
-        # dùng để tính ngân sách output động trong chat(), thay vì cắt cứng ở
-        # 1 số nhỏ tuỳ ý (vd 3000) khiến model reasoning như Qwen3 bị cắt giữa
-        # lúc đang "suy nghĩ" trước khi kịp viết JSON.
-        candidates = []
-        tok_max = getattr(self.tokenizer, "model_max_length", None)
-        if isinstance(tok_max, int) and 0 < tok_max < 10_000_000:
-            candidates.append(tok_max)
-        cfg_max = getattr(self.model.config, "max_position_embeddings", None)
-        if isinstance(cfg_max, int) and cfg_max > 0:
-            candidates.append(cfg_max)
-        self.max_model_context = min(candidates) if candidates else 32768
+        self.max_model_context = n_ctx
 
     def recommended_max_context_tokens(self, configured_default: int) -> int:
-        """Ngân sách token INPUT an toàn cho model local, dựa trên VRAM/RAM
-        thật phát hiện lúc load() thay vì 1 số cố định — máy yếu tự động dùng
-        batch nhỏ hơn (nhiều batch hơn nhưng không OOM), máy mạnh vẫn tận
-        dụng được context lớn như config yêu cầu. Áp dụng cho cả GPU (VRAM)
-        lẫn CPU/MPS (RAM hệ thống) để chạy ổn định trên mọi loại phần cứng."""
-        if self.device == "cuda" and self._free_vram_gb_at_load is not None:
-            free_gb = self._free_vram_gb_at_load
-            # Ước lượng thô: mỗi 1K token input (KV cache, cỡ model 4B) tốn khoảng
-            # 0.35-0.5GB VRAM khi CHƯA quantize, ít hơn khi đã 4-bit. Trừ hao sẵn
-            # phần weights + generate buffer + margin an toàn trước khi chia cho
-            # chi phí/1K token, rồi lấy min với giá trị cấu hình để không vượt
-            # quá cái người dùng chủ động đặt.
-            weights_reserve_gb = 3.0 if self._quantized else 8.5
-            usable_gb = max(0.0, free_gb - weights_reserve_gb - 1.5)  # 1.5GB margin an toàn
-            cost_per_1k_tokens_gb = 0.25 if self._quantized else 0.45
-        elif self._free_ram_gb_at_load is not None:
-            # CPU/MPS: không có ranh giới cứng như CUDA OOM, nhưng RAM ít vẫn
-            # gây swap-thrash (cực chậm) hoặc bị OS kill process -> áp dụng
-            # cùng logic, chỉ đổi hằng số cho phù hợp float32/int8-quantized trên CPU.
-            free_gb = self._free_ram_gb_at_load
-            weights_reserve_gb = 2.5 if self._quantized else 9.0  # Qwen3-4B: ~9GB ở float32, ~2.5GB int8
-            usable_gb = max(0.0, free_gb - weights_reserve_gb - 2.0)  # 2GB margin (OS + process khác)
-            cost_per_1k_tokens_gb = 0.3 if self._quantized else 0.6
-        else:
-            # Không lấy được thông tin phần cứng (thiếu psutil, v.v.) -> giữ
-            # trần thận trọng thay vì tin tưởng mù quáng vào config.
-            return min(configured_default, 12000)
-
-        est_tokens = int((usable_gb / cost_per_1k_tokens_gb) * 1000)
-        est_tokens = max(1500, est_tokens)  # sàn tối thiểu để vẫn xử lý được scene
-        return max(1500, min(configured_default, est_tokens))
+        """Ngân sách token INPUT an toàn cho mỗi batch narration — bị giới
+        hạn CỨNG bởi n_ctx thật sự đã cấp cho llama.cpp lúc load() (không thể
+        "xin thêm" tuỳ RAM còn dư như bản transformers cũ, vì KV cache đã
+        được cấp phát cố định từ đầu)."""
+        return min(configured_default, self.max_model_context)
 
     def unload(self) -> None:
-        del self.model
-        del self.tokenizer
         self.model = None
-        self.tokenizer = None
         gc.collect()
-        if self._torch is not None:
-            try:
-                if self._torch.cuda.is_available():
-                    self._torch.cuda.empty_cache()
-            except Exception:
-                pass
 
     def chat(self, system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
-        """Sinh text qua chat template. Qwen3-4B-Instruct-2507 (bản "Instruct",
-        KHÔNG phải bản "Thinking") không tự chèn suy luận nội bộ vào output
-        mặc định, nên không gặp lại lỗi "nuốt hết token vào suy nghĩ" như
-        model reasoning phía Cerebras.
+        """Sinh text qua chat template gắn sẵn trong GGUF (llama-cpp-python tự
+        đọc chat_template từ metadata của Gemma 4 — không cần tự soạn prompt
+        template tay như bản transformers cũ).
 
-        Tự phục hồi khi OOM: dọn cache + thử lại với max_new_tokens nhỏ hơn
-        trước khi bó tay và raise LocalModelOOMError (để caller chia nhỏ input
-        batch rồi thử lại — xem generate_narration)."""
-        torch = self._torch
+        Tự phục hồi khi hết RAM/context giữa lúc generate: dọn cache + thử
+        lại với max_tokens nhỏ hơn trước khi bó tay và raise LocalModelOOMError
+        (để caller — generate_narration — chia nhỏ batch input rồi thử lại)."""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        prompt_text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
-        input_len = inputs["input_ids"].shape[1]
 
-        # KHÔNG dùng max_new_tokens cố định từ config làm trần sinh text: Qwen3
-        # là model có khả năng suy luận, có thể cần nhiều token cho phần "suy
-        # nghĩ" trước khi viết JSON thật — cắt cứng ở 1 số nhỏ tuỳ ý (vd 3000)
-        # dễ khiến output bị cắt giữa chừng lúc đang suy luận. Thay vào đó,
-        # tính ngân sách output = TOÀN BỘ context còn lại của chính model
-        # (max_model_context - input đã dùng - margin an toàn cho token đặc
-        # biệt) — giới hạn DUY NHẤT còn lại là khả năng thật của model, không
-        # phải một con số áp đặt từ config.toml.
-        safety_margin = 32
+        # Ước lượng input token bằng tokenizer thật của model (qua llama.cpp)
+        # để tính ngân sách output còn lại — QUAN TRỌNG vì llama.cpp raise lỗi
+        # cứng nếu input+output vượt n_ctx, KHÔNG tự cắt bớt như transformers.
+        try:
+            prompt_text = system_prompt + "\n" + user_prompt
+            input_len = len(self.model.tokenize(prompt_text.encode("utf-8")))
+        except Exception:
+            input_len = len(system_prompt + user_prompt) // 3  # ước lượng thô nếu tokenize lỗi
+
+        safety_margin = 64
         context_budget = max(256, self.max_model_context - input_len - safety_margin)
-        attempt_tokens = context_budget
+        attempt_tokens = min(max_new_tokens, context_budget) if max_new_tokens else context_budget
         if max_new_tokens and max_new_tokens > context_budget:
-            print(f"[script_writer] Lưu ý: input dài {input_len} token, model chỉ còn "
-                  f"~{context_budget} token cho output (context thật của model = "
-                  f"{self.max_model_context}) — bỏ qua giới hạn nhỏ hơn từ cấu hình.")
+            print(f"[script_writer] Lưu ý: input dài ~{input_len} token, model chỉ còn "
+                  f"~{context_budget} token cho output (n_ctx={self.max_model_context}) — "
+                  f"giảm max_new_tokens xuống {attempt_tokens}.")
 
         last_err: Exception | None = None
         for attempt in range(3):
             try:
                 print_progress_bar(
                     0, 1, prefix="[script_writer] local",
-                    suffix=f"đang sinh (max {attempt_tokens} token, input {input_len} token)...",
+                    suffix=f"đang sinh (max {attempt_tokens} token, input ~{input_len} token)...",
                 )
-                with torch.no_grad():
-                    output_ids = self.model.generate(
-                        **inputs,
-                        max_new_tokens=attempt_tokens,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        top_k=self.top_k,
-                        do_sample=True,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                    )
+                result = self.model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=attempt_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                )
                 print_progress_bar(1, 1, prefix="[script_writer] local", suffix="xong")
-                gen_ids = output_ids[0][input_len:]
-                return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-            except Exception as e:  # bắt rộng vì OutOfMemoryError có thể là torch.cuda.* hoặc RuntimeError tuỳ version
+                return result["choices"][0]["message"]["content"].strip()
+            except Exception as e:  # bắt rộng vì lỗi hết RAM/context của llama.cpp không có type riêng cố định
                 if not _is_oom_error(e):
                     raise
                 last_err = e
                 gc.collect()
-                try:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                if attempt_tokens > 512:
-                    attempt_tokens = max(512, attempt_tokens // 2)
-                    print(f"[script_writer] CẢNH BÁO: OOM lúc generate — dọn cache và thử lại với "
-                          f"max_new_tokens giảm còn {attempt_tokens} (lần {attempt + 1}/3).")
+                if attempt_tokens > 256:
+                    attempt_tokens = max(256, attempt_tokens // 2)
+                    print(f"[script_writer] CẢNH BÁO: hết RAM/context lúc generate — thử lại với "
+                          f"max_tokens giảm còn {attempt_tokens} (lần {attempt + 1}/3).")
                     continue
                 break
         raise LocalModelOOMError(
-            f"Hết VRAM/RAM khi sinh text (input {input_len} token) dù đã giảm max_new_tokens "
-            f"xuống {attempt_tokens} và dọn cache 3 lần liên tiếp: {last_err}"
+            f"Hết RAM/context khi sinh text (input ~{input_len} token, n_ctx={self.max_model_context}) "
+            f"dù đã giảm max_tokens xuống {attempt_tokens} và thử lại 3 lần liên tiếp: {last_err}"
         ) from last_err
 
 

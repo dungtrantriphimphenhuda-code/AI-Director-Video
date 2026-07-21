@@ -41,12 +41,20 @@ torch>=2.4.0
 qwen-vl-utils>=0.0.14
 pillow>=10.4.0
 
-# --- Script writer (Qwen3-4B-Instruct-2507, backend "local") ---
-# Cho phép quantization 4-bit/8-bit tự động trên GPU ít VRAM (Colab T4 dùng
-# chung, laptop GPU 6-8GB, v.v.) — xem LocalScriptModel trong script_writer.py.
-# "Mềm": nếu cài lỗi/thiếu (vd không có GPU NVIDIA), script_writer.py tự bỏ
-# qua quantization và chạy full-precision, không crash pipeline.
-bitsandbytes>=0.43.0; sys_platform != "darwin"
+# --- Script writer (Gemma 4 E4B QAT, GGUF, backend "local") ---
+# Đổi từ Qwen3-4B-Instruct-2507 (transformers + bitsandbytes) sang Gemma 4
+# E4B bản QAT (Quantization-Aware Training) đã repack sẵn dạng GGUF bởi
+# Unsloth (repo public, KHÔNG cần hf_token — khác với repo gốc google/gemma-4-*
+# vốn bị gate trên Hugging Face). Chạy qua llama.cpp thay vì transformers:
+# nhẹ hơn NHIỀU lần trên CPU (không phải "giả lập" 8bit trên CPU như
+# bitsandbytes, vốn là nguyên nhân runner GitHub Actions bị OOM/"lost
+# communication with the server" trước đây — xem NOTES-AI-DIRECTOR-VIDEO.md),
+# tự tải file .gguf qua huggingface_hub nên vẫn dùng chung cache_dir như cũ.
+# Có sẵn wheel dựng trước (không cần biên dịch) cho Linux/macOS/Windows phổ
+# biến; nếu môi trường lạ không có wheel, pip sẽ tự build từ source (cần
+# cmake, có sẵn trên GitHub Actions ubuntu-latest).
+llama-cpp-python>=0.3.9
+huggingface_hub[hf_transfer]>=0.27.0
 
 # --- Vision (Moondream2, backend "moondream") ---
 einops>=0.7.0
