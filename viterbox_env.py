@@ -20,6 +20,7 @@ dùng 1 lần.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -54,8 +55,24 @@ def _venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def _venv_bin_dir(venv_dir: Path) -> Path:
+    if sys.platform == "win32":
+        return venv_dir / "Scripts"
+    return venv_dir / "bin"
+
+
 def _pip_install(py: Path, *packages: str) -> None:
     subprocess.run([str(py), "-m", "pip", "install", *packages], check=True)
+
+
+def _pip_install_no_isolation(py: Path, venv_dir: Path, *packages: str) -> None:
+    env = os.environ.copy()
+    bin_dir = str(_venv_bin_dir(venv_dir))
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    subprocess.run(
+        [str(py), "-m", "pip", "install", "--no-build-isolation", *packages],
+        check=True, env=env,
+    )
 
 
 def _self_test_import(py: Path) -> tuple[bool, str]:
@@ -118,12 +135,22 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     # Giải pháp: ghim pip về bản ổn định, pin setuptools bản cũ tương thích,
     # và dùng --no-build-isolation để build bằng setuptools trong venv thay vì
     # để pip tự kéo bản mới nhất (dễ vỡ) vào môi trường build tạm.
+    #
+    # QUAN TRỌNG: Pre-install numpy <1.26 (build source với setuptools cũ) và
+    # pandas >=2.1.1 (wheel cho cp312) NGAY TỪ ĐẦU, trước khi install viterbox.
+    # Lý do: pandas 2.1.0 tồn tại dạng source dist dùng meson build backend;
+    # khi pip resolve dependency viterbox với --no-build-isolation, nó chạy
+    # metadata preparation của pandas-2.1.0.tar.gz trong môi trường hiện tại
+    # (không isolation) và gây lỗi "meson executable not found" dù đã cài meson.
+    # Pre-install pandas >=2.1.1 (có wheel sẵn, không cần build) giúp pip
+    # không bao giờ đụng tới pandas-2.1.0.tar.gz. Tương tự, pre-install numpy
+    # tránh việc pip phải build numpy từ source trong lúc install viterbox.
     _pip_install(py, "pip==24.3.1")
-    _pip_install(py, "setuptools==68.2.2", "wheel", "meson-python", "meson", "ninja")
-    subprocess.run(
-        [str(py), "-m", "pip", "install", "--no-build-isolation", _VITERBOX_GIT_URL],
-        check=True,
-    )
+    _pip_install(py, "setuptools==68.2.2", "wheel")
+    _pip_install_no_isolation(py, venv_dir,
+        "numpy<1.26", "pandas>=2.1.1",
+        "meson-python", "meson", "ninja")
+    _pip_install_no_isolation(py, venv_dir, _VITERBOX_GIT_URL)
 
     # Cài bù các dependency mà gói viterbox gốc quên khai báo (xem
     # _KNOWN_MISSING_DEPS ở trên) — làm ngay để đỡ phải chờ self-test loop.
