@@ -147,9 +147,19 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     # tránh việc pip phải build numpy từ source trong lúc install viterbox.
     _pip_install(py, "pip==24.3.1")
     _pip_install(py, "setuptools==68.2.2", "wheel")
+    # QUAN TRỌNG (fix lỗi ResolutionImpossible trên Python 3.12+):
+    # Không được yêu cầu numpy<1.26 và pandas>=2.1.1 trong CÙNG 1 lệnh pip,
+    # vì MỌI bản pandas>=2.1.1 đều khai báo phụ thuộc numpy>=1.26.0 khi
+    # python_version>=3.12 -> pip resolver luôn báo xung đột không thể giải
+    # (xem traceback CI thực tế). Mục đích ban đầu của việc pre-install pandas
+    # ở đây chỉ là để tránh pip sau này (lúc cài viterbox) phải build
+    # pandas-2.1.0.tar.gz (sdist dùng meson). Ta vẫn đạt mục đích đó bằng cách
+    # cài pandas RIÊNG với --no-deps, để pip không kiểm tra/khớp lại yêu cầu
+    # numpy của pandas (numpy<1.26 đã cài ở venv vẫn hoạt động bình thường lúc
+    # runtime dù metadata của pandas "muốn" bản mới hơn).
     _pip_install_no_isolation(py, venv_dir,
-        "numpy<1.26", "pandas>=2.1.1",
-        "meson-python", "meson", "ninja")
+        "numpy<1.26", "meson-python", "meson", "ninja")
+    _pip_install(py, "pandas>=2.1.1", "--no-deps")
     _pip_install_no_isolation(py, venv_dir, _VITERBOX_GIT_URL)
 
     # Cài bù các dependency mà gói viterbox gốc quên khai báo (xem
