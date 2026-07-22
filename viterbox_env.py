@@ -108,7 +108,16 @@ def ensure_viterbox_env(project_root: Path) -> Path:
           "torch/transformers/numpy phiên bản do viterbox tự ghim, KHÔNG liên "
           "quan tới version trong requirements.txt chính) — lần đầu có thể mất "
           "vài phút vì phải tải torch + model AI (~3-4GB)...")
-    _pip_install(py, "--upgrade", "pip")
+
+    # LƯU Ý: viterbox ghim numpy<1.26.0 (vd 1.25.2), bản này KHÔNG có wheel
+    # dựng sẵn cho Python 3.12+ nên pip phải build từ source. Bản pip mới
+    # nhất (vd 26.x) không còn tự động cấp 'setuptools' cho build isolation
+    # của các gói sdist kiểu này -> lỗi "Cannot import 'setuptools.build_meta'".
+    # Để tránh lỗi này: (1) ghim pip về bản ổn định đã biết chạy tốt thay vì
+    # luôn lấy bản mới nhất, và (2) cài sẵn setuptools/wheel vào venv TRƯỚC
+    # khi cài viterbox.
+    _pip_install(py, "pip==24.3.1")
+    _pip_install(py, "setuptools", "wheel")
     _pip_install(py, _VITERBOX_GIT_URL)
 
     # Cài bù các dependency mà gói viterbox gốc quên khai báo (xem
