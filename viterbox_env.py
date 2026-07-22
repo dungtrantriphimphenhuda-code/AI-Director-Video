@@ -119,7 +119,7 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     # và dùng --no-build-isolation để build bằng setuptools trong venv thay vì
     # để pip tự kéo bản mới nhất (dễ vỡ) vào môi trường build tạm.
     _pip_install(py, "pip==24.3.1")
-    _pip_install(py, "setuptools==68.2.2", "wheel")
+    _pip_install(py, "setuptools==68.2.2", "wheel", "meson-python", "ninja")
     subprocess.run(
         [str(py), "-m", "pip", "install", "--no-build-isolation", _VITERBOX_GIT_URL],
         check=True,
