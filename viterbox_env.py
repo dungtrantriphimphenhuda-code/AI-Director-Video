@@ -147,6 +147,15 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     # tránh việc pip phải build numpy từ source trong lúc install viterbox.
     _pip_install(py, "pip==24.3.1")
     _pip_install(py, "setuptools==68.2.2", "wheel")
+    # QUAN TRỌNG (fix lỗi "ModuleNotFoundError: No module named 'Cython'" /
+    # "OSError: Cython needs to be installed in Python as a module"):
+    # numpy<1.26 không có wheel dựng sẵn cho Python 3.12+ nên phải build từ
+    # source (sdist). Vì dùng --no-build-isolation, MỌI build-dependency của
+    # numpy (kể cả Cython dùng để sinh code C từ .pyx) phải được cài SẴN vào
+    # venv trước khi build — pip sẽ không tự tải Cython vào môi trường build
+    # tạm như khi build isolation bật. Phải cài Cython ở bước riêng này,
+    # TRƯỚC lệnh build numpy ở dưới.
+    _pip_install(py, "Cython<3")
     # QUAN TRỌNG (fix lỗi ResolutionImpossible trên Python 3.12+):
     # Không được yêu cầu numpy<1.26 và pandas>=2.1.1 trong CÙNG 1 lệnh pip,
     # vì MỌI bản pandas>=2.1.1 đều khai báo phụ thuộc numpy>=1.26.0 khi
