@@ -169,7 +169,41 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     _pip_install_no_isolation(py, venv_dir,
         "numpy<1.26", "meson-python", "meson", "ninja")
     _pip_install(py, "pandas>=2.1.1", "--no-deps")
-    _pip_install_no_isolation(py, venv_dir, _VITERBOX_GIT_URL)
+
+    # QUAN TRỌNG (fix lỗi "ModuleNotFoundError: No module named 'versioneer'"
+    # khi cài viterbox): package viterbox kéo theo gradio==5.44.1, gradio yêu
+    # cầu "pandas<3.0,>=1.0". Vì numpy đã bị ghim <1.26 ở trên, MỌI bản pandas
+    # >=2.1.1 đều bị pip coi là không tương thích (pandas>=2.1.1 khai báo cần
+    # numpy>=1.26.0 khi python_version>=3.12) -> pip resolver tự động
+    # backtrack lùi dần xuống pandas 2.1.0 (bản duy nhất không đòi numpy>=1.26)
+    # để tìm bản "khớp". Nhưng pandas 2.1.0 không có wheel cho cp312 nên phải
+    # build từ source bằng meson, và bước build đó cần module build
+    # "versioneer" — thứ mà pip CHỈ tự tải khi build có isolation (ta lại
+    # đang tắt isolation ở đây). Kết quả: build lỗi "No module named
+    # 'versioneer'", xảy ra dù pandas bản mới đã cài sẵn ở dòng trên.
+    #
+    # Cách chặn dứt điểm (không chỉ vá lỗi thiếu module mà loại bỏ hẳn
+    # nguyên nhân gây backtrack): ghi ra 1 file constraints ghim CHÍNH XÁC
+    # version numpy/pandas vừa cài, rồi bắt lệnh cài viterbox tuân theo file
+    # này (--constraint). Nhờ vậy pip biết ngay pandas/numpy đã cài sẵn là
+    # "hợp lệ theo yêu cầu", không cần dò tìm/backtrack version khác nữa ->
+    # không bao giờ đụng tới pandas-2.1.0.tar.gz. Vẫn cài thêm "versioneer"
+    # làm lưới an toàn phòng khi có package khác (ngoài pandas) cũng cần build
+    # từ source và đòi versioneer.
+    freeze = subprocess.run(
+        [str(py), "-m", "pip", "freeze"], capture_output=True, text=True, check=True
+    ).stdout
+    pinned_lines = [
+        line for line in freeze.splitlines()
+        if line.split("==")[0].strip().lower() in ("numpy", "pandas")
+    ]
+    constraints_path = venv_dir / "_pinned_constraints.txt"
+    constraints_path.write_text("\n".join(pinned_lines) + "\n", encoding="utf-8")
+    print(f"[viterbox-env] Ghim version để pip không backtrack pandas/numpy: {pinned_lines}")
+
+    _pip_install(py, "versioneer")
+    _pip_install_no_isolation(py, venv_dir,
+        "--constraint", str(constraints_path), _VITERBOX_GIT_URL)
 
     # Cài bù các dependency mà gói viterbox gốc quên khai báo (xem
     # _KNOWN_MISSING_DEPS ở trên) — làm ngay để đỡ phải chờ self-test loop.
