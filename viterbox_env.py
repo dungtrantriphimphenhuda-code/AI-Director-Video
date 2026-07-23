@@ -168,7 +168,13 @@ def ensure_viterbox_env(project_root: Path) -> Path:
     # runtime dù metadata của pandas "muốn" bản mới hơn).
     _pip_install_no_isolation(py, venv_dir,
         "numpy<1.26", "meson-python", "meson", "ninja")
-    _pip_install(py, "pandas>=2.1.1", "--no-deps")
+    # QUAN TRỌNG (fix lỗi ResolutionImpossible do pandas 3.0 mới phát hành):
+    # Trước đây "pandas>=2.1.1" luôn ra bản pandas 2.x mới nhất, nhưng từ khi
+    # pandas 3.0 ra mắt, pip sẽ chọn pandas 3.0.x (vẫn thỏa >=2.1.1). Bản này
+    # bị ghim vào file constraints ở dưới, khiến bước cài viterbox (kéo theo
+    # gradio==5.44.1, yêu cầu pandas<3.0) không thể giải được nữa
+    # (ResolutionImpossible). Phải chặn trần <3.0 ngay từ bước pre-install này.
+    _pip_install(py, "pandas>=2.1.1,<3.0", "--no-deps")
 
     # QUAN TRỌNG (fix lỗi "ModuleNotFoundError: No module named 'versioneer'"
     # khi cài viterbox): package viterbox kéo theo gradio==5.44.1, gradio yêu
