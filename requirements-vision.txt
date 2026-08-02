@@ -1,0 +1,14 @@
+# Vision backends chạy model LOCAl qua transformers (Qwen3-VL backend "local",
+# Moondream2 backend "moondream") — chỉ cần khi vision_backend dùng tới chúng.
+#
+# LƯU Ý pin transformers: >=5.10.1 bắt buộc cho AutoModelForMultimodalLM
+# (Gemma 4), và vision.py đã có _patch_transformers_v5_tied_weights_compat()
+# nên bản v5 vẫn an toàn cho Moondream (không cần hạ xuống <5.0.0 như trước).
+transformers>=5.10.1
+accelerate>=1.2.0
+torch>=2.4.0
+torchvision>=0.19.0
+qwen-vl-utils>=0.0.14
+av>=13.0.0
+einops>=0.7.0
+pillow>=10.4.0

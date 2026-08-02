@@ -1,0 +1,92 @@
+name: Cleanup Cloud Projects
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Go "yes" de xac nhan xoa TOAN BO project tren cloud'
+        required: true
+        default: ""
+  schedule:
+    # 09:00 gio Viet Nam (UTC+7) = 02:00 UTC, chu nhat hang tuan
+    - cron: "0 2 * * 0"
+
+concurrency:
+  group: ai-director-video-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup-cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify confirmation (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+            echo "::error::Ban can go 'yes' o input 'confirm' de xac nhan xoa."
+            exit 1
+          fi
+          echo "Da xac nhan. Bat dau xoa toan bo project tren cloud."
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Delete all projects from cloud
+        shell: python
+        run: |
+          import sys
+
+          sys.path.insert(0, '.')
+          from config import load_config
+          from cloud_storage import get_cloud_storage_from_config
+
+          cfg = load_config('config.toml')
+          storage = get_cloud_storage_from_config(cfg)
+          if storage is None:
+              print('::error::Khong khoi tao duoc cloud storage. Kiem tra config.toml muc [cloud].')
+              sys.exit(1)
+
+          projects = storage.list_remote_projects()
+          if not projects:
+              print('Khong co project nao tren cloud. Ket thuc.')
+              sys.exit(0)
+
+          print(f'Tim thay {len(projects)} project tren cloud:')
+          for p in projects:
+              print(f'  - {p["project_id"]} ({p["status"]}, {p["file_count"]} files)')
+
+          total_files = sum(p['file_count'] for p in projects)
+          print(f'Tong: {total_files} files. Dang xoa...')
+
+          deleted_all = 0
+          failed = []
+          for p in projects:
+              pid = p['project_id']
+              print(f'Dang xoa project: {pid}...')
+              try:
+                  storage.delete_project(pid)
+                  deleted_all += 1
+              except Exception as e:
+                  print(f'  LOI: {e}')
+                  failed.append(pid)
+
+          print(f'Ket qua: da xoa {deleted_all}/{len(projects)} project.')
+          if failed:
+              print(f'Project loi: {failed}')
+              print('Dang xoa sot cac file con lai duoi prefix projects/...')
+              try:
+                  keys = storage._list_files('projects/')
+                  for k in keys:
+                      storage._delete_file(k)
+                  print(f'Da xoa them {len(keys)} file sot.')
+              except Exception as e:
+                  print(f'Loi khi xoa file sot: {e}')

@@ -1,0 +1,160 @@
+# =============================================================================
+# config.ci.toml.template — TEMPLATE THAM KHẢO (file cũ) cho cấu hình chạy trên
+# GitHub Actions.
+#
+# LƯU Ý: workflow hiện tại (.github/workflows/run-pipeline.yml) ĐÃ CHUYỂN sang
+# đọc thẳng config.toml (đã commit kèm key thật) — KHÔNG còn render file này
+# từ GitHub Secrets như trước. File này chỉ giữ lại như tài liệu tham khảo cho
+# bộ tham số "nhẹ/an toàn trên CI" (tự đổi backend nặng sang API), nếu sau này
+# bạn muốn quay lại cơ chế secrets hoặc so sánh cấu hình.
+#
+# Các chỗ ${TEN_BIEN} dưới đây chỉ là placeholder cho bộ đọc thay thế; config
+# thật phải nằm trong config.toml với giá trị cụ thể.
+# =============================================================================
+
+[api]
+# GitHub Actions runner miễn phí chỉ đảm bảo ~14GB disk trống (kể cả sau khi
+# nâng lên 4vCPU/16GB RAM cuối 2023) -> "local" (tải Qwen3-4B-Instruct về
+# chạy ngay trên máy, ~8GB) rất dễ làm hết disk/RAM giữa chừng, khiến job bị
+# runner kill và GitHub hiện "The operation was canceled". Dùng thẳng
+# Cerebras API (đã có secret CEREBRAS_API_KEY) thay vì tải model về.
+# LƯU Ý: config.py (_apply_ci_safe_overrides) đã TỰ ĐỘNG ép giá trị này về
+# "cerebras" khi phát hiện chạy trong GitHub Actions (biến GITHUB_ACTIONS),
+# kể cả khi file config.toml thật sự dùng lại là bản full có "local" (như
+# khi bạn commit thẳng config.toml vào repo) — dòng dưới đây chỉ để rõ ý
+# định, không phải chỗ duy nhất chặn vấn đề này.
+script_backend = "cerebras"
+
+cerebras_api_key = "${CEREBRAS_API_KEY}"
+cerebras_base_url = "https://api.cerebras.ai/v1"
+cerebras_model = "zai-glm-4.7"
+cerebras_max_tokens = 8000
+cerebras_temperature = 0.8
+
+hf_token = "${HF_TOKEN}"
+
+mistral_api_key = "${MISTRAL_API_KEY}"
+mistral_base_url = "https://api.mistral.ai/v1"
+
+[tts]
+# piper chạy LOCAL trên CPU (ONNX Runtime, vài chục MB, không cần GPU/venv
+# riêng) -> tránh hẳn lỗi "edge_tts.exceptions.NoAudioReceived" hay gặp khi
+# edge-tts chạy từ IP datacenter của GitHub Actions (bị chặn/rate-limit phía
+# Microsoft), ĐỒNG THỜI tránh luôn lỗi cài đặt của engine local cũ (viterbox,
+# đã gỡ bỏ) vốn ghim numba/librosa không có wheel cho Python 3.12 trên CI.
+# Tốc độ gần như real-time ngay cả trên runner miễn phí không GPU.
+engine = "piper"
+piper_voice = "vi_VN-vais1000-medium"
+
+# ---- edge-tts (dự phòng) ----
+voice = "vi-VN-HoangMinhNeural"
+rate = "+0%"
+volume = "+0%"
+pitch = "+0Hz"
+
+[processing]
+# ---- ASR ----
+# CI dùng thẳng "whisper" (faster-whisper): máy ảo GitHub Actions không có
+# GPU và không nên tải thêm các model FunASR (VAD/punc/ASR riêng, khá nặng)
+# mỗi lần chạy CI — nếu cần test FunASR, đổi sang "funasr" và tự chấp nhận
+# thời gian tải model lâu hơn. asr.py vẫn tự fallback về whisper nếu funasr
+# lỗi, nên đổi giá trị này là đủ, không cần sửa code.
+asr_backend = "whisper"
+asr_funasr_model = "paraformer-zh"
+asr_funasr_vad_model = "fsmn-vad"
+asr_funasr_punc_model = "ct-punc"
+asr_funasr_device = "cpu"
+asr_funasr_language = "auto"
+
+# ---- ASR — faster-whisper ----
+asr_model_size = "small"
+asr_device = "cpu"          # máy ảo GitHub Actions KHÔNG có GPU -> luôn "cpu"
+asr_compute_type = "int8"   # int8 nhanh hơn trên CPU so với float16
+asr_language = "vi"
+
+# ---- Vision ----
+# MẪU NÀY vẫn đặt "mistral" làm mặc định an toàn. NHƯNG backend "gemma4_video"
+# (Gemma 4 12B QAT) giờ chạy QUA OLLAMA (GGUF ~7GB, llama.cpp CPU) — nhẹ đủ
+# để chạy ngay trên GitHub Actions runner (~16GB RAM), và config.py KHÔNG còn
+# ép nó xuống "mistral" nữa. Muốn CI dùng Gemma 4 12B thật sự thì sửa
+# config.toml (đã commit) đặt vision_backend = "gemma4_video" — workflow
+# run-pipeline.yml tự cài Ollama + pull gemma4:12b-it-qat + warm-up trước khi
+# chạy pipeline.
+vision_backend = "mistral"
+vision_device = "cpu"
+vision_dtype = "float32"
+vision_max_new_tokens = 512
+vision_attn_implementation = "sdpa"
+vision_batch_size = 1
+# Giảm còn 1 (thay vì 3) so với mặc định để bớt tải CPU cho "moondream" trên
+# CI — đổi lại phân tích cảnh sẽ kém chi tiết hơn đôi chút, nhưng đỡ rủi ro
+# treo/timeout với video dài hơn.
+vision_frames_per_scene = 1
+
+# ---- Scene detection ----
+scene_threshold = 27.0
+min_scene_len_sec = 1.0
+
+# ---- Narration / storyboard ----
+narration_pov = "third_person"
+content_type = "movie"
+genre = "drama"
+target_duration_sec = 180
+# CI luôn chạy non-interactive (không có TTY) -> giá trị này thực tế không
+# được dùng tới (hook #1 được chọn ngay lập tức), giữ lại chỉ để nhất quán
+# với config.toml/config.toml.example.
+hook_selection_timeout_sec = 300
+chars_per_sec = 4.0
+words_per_sec = 2.5
+buffer_after_speech = 0.1
+min_clip_duration = 1.0
+max_speed_ratio = 4.0
+
+# ---- Checkpoint frequency ----
+micro_checkpoint_interval = 1
+auto_sync_cloud = true
+
+[ci]
+# Mặc định AN TOÀN cho template: true = luôn tự đổi backend "local"/"funasr"
+# sang API (cerebras/mistral/whisper) khi phát hiện chạy trong GitHub
+# Actions (xem config.py _apply_ci_safe_overrides). Đổi thành false CHỈ khi
+# đã tự xác nhận runner đủ disk/RAM để chạy local (xem hướng dẫn trong
+# README mục "Chạy tự động bằng GitHub Actions").
+force_lightweight_backends = true
+
+[reference]
+urls = []
+languages = ["vi", "en"]
+max_chars_per_video = 6000
+use_ytdlp_fallback = true
+ytdlp_cookies_from_browser = ""
+
+[paths]
+input_video = "./input/source.mp4"
+output_dir = "./output"
+checkpoint_dir = "./checkpoints"
+model_cache_dir = "./model_cache"
+projects_dir = "./projects"
+
+[cloud]
+# BẮT BUỘC bật cloud + điền đúng secret: đây là nơi DUY NHẤT project được
+# lưu lại giữa các lần chạy, vì máy ảo GitHub Actions bị xoá sạch sau mỗi
+# lần chạy xong.
+access_key = "${CLOUD_ACCESS_KEY}"
+secret_key = "${CLOUD_SECRET_KEY}"
+bucket_name = "${CLOUD_BUCKET_NAME}"
+endpoint_url = "${CLOUD_ENDPOINT_URL}"
+region_name = "${CLOUD_REGION_NAME}"
+addressing_style = "${CLOUD_ADDRESSING_STYLE}"
+enabled = true
+
+[project]
+auto_project_scan = true
+show_project_menu_on_start = false   # bắt buộc false để chạy non-interactive
+auto_save_interval = 0
+cloud_sync_retries = 3
+# Tự động xoá project cũ, chỉ giữ lại 1 project mới nhất (local + cloud).
+# Đặt auto_prune_old_projects = false nếu muốn giữ nhiều project song song
+# trên CI; tăng keep_projects_count nếu muốn giữ nhiều hơn 1.
+auto_prune_old_projects = true
+keep_projects_count = 1

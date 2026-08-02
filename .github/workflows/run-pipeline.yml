@@ -1,0 +1,239 @@
+name: Run AI Director Video Pipeline
+
+# ĐÃ ĐỔI SANG DÙNG THẲNG config.toml (đã commit kèm API key thật vào repo
+# theo README mục "Chạy tự động bằng GitHub Actions") — KHÔNG dùng
+# config.ci.toml.template + GitHub Secrets nữa. Rủi ro (repo public lộ key)
+# người dùng đã tự xác nhận chấp nhận; workflow này chỉ đọc thẳng config.toml
+# có sẵn trong repo, không render gì thêm.
+
+on:
+  schedule:
+    # 01:00 UTC = 08:00 giờ Việt Nam (UTC+7), chạy mỗi ngày.
+    - cron: "0 1 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  # Không cho 2 lần chạy chồng lên nhau (tránh 2 job cùng đụng vào 1 project
+  # trên cloud cùng lúc — checkpoint/cloud sync không được thiết kế cho
+  # ghi đồng thời).
+  group: ai-director-video-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    # Chừa dư so với giới hạn cứng 6h/job của GitHub để job luôn có cơ hội
+    # chạy xong bước dọn rác + đóng dashboard gọn gàng thay vì bị kill giữa
+    # chừng đúng lúc đang ghi checkpoint.
+    timeout-minutes: 350
+
+    # ---- Ollama env (Gemma 4 12B QAT chạy qua llama.cpp) ----
+    # Đúng cơ chế đã kiểm chứng chạy thành công trên GitHub Actions ở dự án
+    # fork OpenManus (handandfeet-agent):
+    #   - OLLAMA_MAX_LOADED_MODELS=1: giữ ĐÚNG 1 model trong RAM (~7GB), không
+    #     load thêm model khác khiến runner 16GB bị OOM.
+    #   - OLLAMA_KEEP_ALIVE: giữ model trong RAM suốt stage vision (không
+    #     unload/load lại giữa các clip — mỗi lần reload tốn cả phút).
+    #   - OLLAMA_CONTEXT_LENGTH: context window cho model (~6 ảnh + phụ đề +
+    #     thinking). 32768 là đủ rộng và an toàn RAM, không cần 128K.
+    env:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_CONTEXT_LENGTH: "32768"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Ollama requirement (theo vision_backend trong config.toml)
+        id: detect-ollama
+        run: |
+          BACKEND=$(python3 -c "
+          import tomllib
+          with open('config.toml', 'rb') as f:
+              cfg = tomllib.load(f)
+          print(cfg.get('processing', {}).get('vision_backend', 'gemma4_video'))
+          ")
+          echo "vision_backend=$BACKEND"
+          # Chỉ backend gemma4_video cần Ollama trên CI. Các backend "local"
+          # khác (local/moondream) bị _apply_ci_safe_overrides trong config.py
+          # ép sang API mistral, còn script_backend local ép sang cerebras —
+          # nên không có model AI cục bộ nào khác cần tải trên runner.
+          if [ "$BACKEND" = "gemma4_video" ]; then
+            echo "NEEDS_OLLAMA=true"
+            echo "NEEDS_OLLAMA=true" >> "$GITHUB_ENV"
+          else
+            echo "NEEDS_OLLAMA=false"
+            echo "NEEDS_OLLAMA=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Free disk space (dọn rác runner trước khi tải model local)
+        run: |
+          echo "--- Disk trước khi dọn ---"
+          df -h /
+          # Gỡ các bộ công cụ cài sẵn nhưng project này KHÔNG dùng tới
+          # (.NET, Android SDK, GHC, CodeQL, Boost...) — kỹ thuật quen thuộc
+          # để lấy lại 15-25GB trên runner GitHub-hosted, cần thiết khi ưu
+          # tiên chạy backend "local" (model AI tải về máy) thay vì gọi API.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"/PyPy \
+            /usr/lib/jvm /opt/az 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          sudo apt-get clean || true
+          echo "--- Disk sau khi dọn ---"
+          df -h /
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Ensure ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+          else
+            echo "ffmpeg đã có sẵn trên runner, bỏ qua cài đặt."
+          fi
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 💾 Cache Ollama models
+        if: env.NEEDS_OLLAMA == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          # key theo model để đổi model là cache tự miss (pull lại bản mới)
+          key: ollama-models-gemma4-12b-it-qat-${{ runner.os }}
+          restore-keys: |
+            ollama-models-gemma4-12b-it-qat-
+
+      - name: 🔧 Install Ollama
+        if: env.NEEDS_OLLAMA == 'true'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+
+      - name: 🚀 Start Ollama server (background)
+        if: env.NEEDS_OLLAMA == 'true'
+        run: |
+          sudo systemctl stop ollama 2>/dev/null || true
+          nohup ollama serve > ollama-server.log 2>&1 &
+          echo "OLLAMA_PID=$!" >> "$GITHUB_ENV"
+
+          echo "⏳ Đợi Ollama server sẵn sàng..."
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:11434/api/tags | grep -q "200"; then
+              echo "✅ Ollama server sẵn sàng sau ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "❌ Ollama server không khởi động được sau 30s"
+              cat ollama-server.log
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -s http://localhost:11434/api/tags
+
+      - name: ⬇️ Pull Gemma 4 12B model (retry tối đa 3 lần)
+        if: env.NEEDS_OLLAMA == 'true'
+        run: |
+          MODEL="gemma4:12b-it-qat"
+          echo "Pulling $MODEL..."
+          for attempt in 1 2 3; do
+            if ollama pull "$MODEL"; then
+              echo "✅ Pull thành công (lần $attempt)"
+              break
+            fi
+            echo "⚠️ Pull thất bại lần $attempt"
+            if [ "$attempt" -eq 3 ]; then
+              echo "❌ Pull model thất bại sau 3 lần thử"
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          ollama list
+          du -sh ~/.ollama/models/ 2>/dev/null || true
+          df -h /
+
+      - name: 🩺 Warm-up model (kiểm tra sớm OOM/content rỗng)
+        if: env.NEEDS_OLLAMA == 'true'
+        run: |
+          MODEL="gemma4:12b-it-qat"
+          echo "Warm-up $MODEL (reasoning_effort=high)..."
+          RESP=$(time curl -s http://localhost:11434/v1/chat/completions -d "{
+            \"model\": \"$MODEL\",
+            \"messages\": [{\"role\": \"user\", \"content\": \"Xin chào, bạn là ai?\"}],
+            \"max_tokens\": 4096,
+            \"reasoning_effort\": \"high\"
+          }")
+          echo "$RESP" | head -c 800
+          echo ""
+          echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); c=d['choices'][0]['message'].get('content'); sys.exit(0 if c else 1)" \
+            && echo "✅ content trả về không rỗng" \
+            || echo "⚠️ CẢNH BÁO: content rỗng khi warm-up (có thể do thinking ăn hết max_tokens)."
+
+      - name: Verify config.toml exists
+        run: |
+          if [ ! -f config.toml ]; then
+            echo "::error::Không tìm thấy config.toml trong repo. Xem README mục" \
+                 "'Chạy tự động bằng GitHub Actions' để commit file này (kèm API key thật)."
+            exit 1
+          fi
+
+      - name: Start progress dashboard tunnel (Cloudflare Quick Tunnel)
+        run: |
+          # Cloudflare Quick Tunnel: KHÔNG cần tài khoản Cloudflare, KHÔNG cần
+          # API token/DNS riêng — chỉ cần binary cloudflared, tự cấp 1 link
+          # https://xxxx.trycloudflare.com sống trong lúc tiến trình còn chạy.
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8787 > cloudflared.log 2>&1 &
+          disown
+
+          echo "Đang đợi cloudflared cấp link (tối đa 30s)..."
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -n1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 1
+          done
+
+          {
+            echo "### 📺 Theo dõi tiến trình pipeline trực tiếp"
+            if [ -n "$URL" ]; then
+              echo "$URL"
+              echo ""
+              echo "_Link chỉ tồn tại trong lúc job này đang chạy — hiện % hoàn tất từng" \
+                   "stage kèm ETA dự đoán, tự làm mới mỗi 3 giây._"
+            else
+              echo "⚠️ Không lấy được link sau 30s — xem log bước này hoặc file \`cloudflared.log\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "PROGRESS_URL=${URL:-unavailable}" >> "$GITHUB_ENV"
+          echo "Link dashboard: ${URL:-(không lấy được)}"
+
+      - name: Run pipeline (ci_run_latest_project.py)
+        run: python ci_run_latest_project.py
+
+      - name: Stop tunnel
+        if: always()
+        run: |
+          pkill -f "cloudflared tunnel" || true
+
+      - name: Upload cloudflared log (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-log
+          path: cloudflared.log
+          if-no-files-found: ignore
+          retention-days: 3

@@ -1,0 +1,31 @@
+# AI Director Video Commentary — core dependencies.
+# Only what is needed to run the pipeline skeleton: config parsing, scene
+# detection, rendering, project management. Heavy/backend-specific packages
+# are split into optional files so you only install what you actually use:
+#
+#   pip install -r requirements.txt              # core (bắt buộc)
+#   pip install -r requirements-asr.txt          # FunASR / faster-whisper
+#   pip install -r requirements-vision.txt       # transformers local vision (Qwen3-VL / Moondream)
+#   pip install -r requirements-llm.txt          # script writer: llama.cpp GGUF + API client
+#   pip install -r requirements-tts.txt          # edge-tts / piper / google-genai
+#   pip install -r requirements-cloud.txt        # boto3 (Tigris/S3-compatible)
+#   pip install -r requirements-reference.txt    # youtube-transcript-api + yt-dlp
+#
+# run.py (ensure_python_packages) tự cài đúng nhóm cần thiết dựa trên backend
+# đang chọn trong config.toml — không cần tự nhớ cài thủ công.
+
+# --- Config ---
+tomli>=2.0.1; python_version < "3.11"
+
+# --- System info (RAM detection for local model sizing) ---
+psutil>=5.9.0
+
+# --- Scene detection / video processing (preprocess luôn chạy) ---
+scenedetect[opencv]>=0.7
+opencv-python>=4.13.0
+
+# --- Subtitle generation (render luôn chạy) ---
+srt>=3.5.3
+
+# --- HTTP client (vision backend "gemma4_video" qua Ollama, reference video) ---
+requests>=2.32.3

@@ -1,0 +1,4 @@
+# TTS engines — chỉ cần cài engine bạn dùng (tts.engine trong config.toml).
+edge-tts>=6.1.19
+piper-tts>=1.3.0
+google-genai>=1.0.0

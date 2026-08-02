@@ -1,0 +1,4 @@
+# Reference video (transcript của video đối thủ cho director_brief) — cả hai
+# đều "mềm": thiếu thì reference_video.py tự bỏ qua, không crash pipeline.
+youtube-transcript-api>=0.6.2
+yt-dlp>=2024.12.13

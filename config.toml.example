@@ -1,0 +1,232 @@
+# =============================================================================
+# config.toml — cấu hình trung tâm cho AI Director Video Commentary (bản Colab)
+# Không còn dùng .env / os.getenv. Mọi module đọc cấu hình từ file này.
+# =============================================================================
+
+[api]
+# Backend viết kịch bản: "local" (mặc định, dùng GGUF qua llama.cpp) hoặc
+# "cerebras" (API OpenAI-compatible).
+script_backend = "local"
+# API key và endpoint cho backend "cerebras" (tuỳ chọn, chỉ dùng khi
+# script_backend = "cerebras").
+# Model mặc định của backend API hiện là `zai-glm-4.7`.
+cerebras_api_key = "PASTE_YOUR_CEREBRAS_API_KEY_HERE"
+cerebras_base_url = "https://api.cerebras.ai/v1"
+cerebras_model = "zai-glm-4.7"
+cerebras_max_tokens = 8000
+cerebras_temperature = 0.8
+
+# Gemini API key (chỉ dùng khi tts.engine = "gemini") — lấy miễn phí tại
+# https://aistudio.google.com/apikey
+gemini_api_key = "PASTE_YOUR_GEMINI_API_KEY_HERE"
+
+# Hugging Face token — chỉ cần nếu Qwen3-VL-4B-Instruct hoặc model cần auth.
+hf_token = ""
+
+# API key cho vision backend "mistral" (độc lập với Cerebras ở trên — chỉ
+# dùng riêng cho stage đọc ảnh, không đụng tới engine viết kịch bản).
+mistral_api_key = "PASTE_YOUR_MISTRAL_API_KEY_HERE"
+mistral_base_url = "https://api.mistral.ai/v1"
+
+[tts]
+# "piper" (MẶC ĐỊNH): model TTS LOCAL cực nhẹ (ONNX Runtime, vài chục MB),
+# không cần API key, không cần GPU, không cần venv riêng, không phụ thuộc
+# mạng lúc chạy (chỉ tải giọng ~vài chục MB một lần đầu) — đơn giản, ổn định,
+# chạy gần như real-time ngay cả trên CPU yếu. Xem "piper_*" bên dưới.
+# "edge-tts": không cần API key, chỉ cần chọn giọng. Lưu ý: API không chính
+# thức của Microsoft, thỉnh thoảng bị chặn/rớt kết nối khi chạy từ IP
+# datacenter (vd GitHub Actions) -> lỗi "NoAudioReceived".
+# "gemini": gọi Gemini TTS API của Google (cần điền api.gemini_api_key ở
+# trên) — giọng tự nhiên nhất, nhưng cần internet + API key.
+engine = "piper"
+
+# ---- piper (dùng khi engine = "piper") ----
+# Định dạng: "<mã_ngôn_ngữ>-<tên_giọng>-<chất_lượng>". Danh sách đầy đủ:
+# https://github.com/rhasspy/piper/blob/master/VOICES.md
+# Model tự động tải về lần đầu chạy.
+piper_voice = "vi_VN-vais1000-medium"
+
+# ---- edge-tts (dùng khi engine = "edge-tts") ----
+# Giọng mặc định. Ví dụ khác: "en-US-JennyNeural", "vi-VN-NamMinhNeural"
+voice = "vi-VN-HoangMinhNeural"
+rate = "+0%"
+volume = "+0%"
+pitch = "+0Hz"
+
+[processing]
+# ---- Script writing (hooks + narration), backend "local" ----
+# Mặc định dùng Gemma 4 12B Instruct QAT bản GGUF từ LM Studio Community để
+# tăng chất lượng script so với model local nhẹ trước đây.
+# Repo public, không bị gate, nên không cần `api.hf_token`.
+script_local_gguf_repo = "lmstudio-community/gemma-4-12B-it-QAT-GGUF"
+script_local_gguf_filename = "gemma-4-12B-it-QAT-Q4_0.gguf"
+script_local_device = "auto"          # auto | cuda | cpu
+script_local_gpu_layers = "auto"      # auto | số nguyên (vd -1, 0, 20)
+script_local_temperature = 0.7
+script_local_top_p = 0.8
+script_local_top_k = 20
+script_local_max_new_tokens = 3000
+script_local_max_context_tokens = 16000
+
+# ---- ASR ----
+# "funasr" (MẶC ĐỊNH): dùng FunASR (Paraformer/SenseVoice) làm ASR chính.
+# "whisper": dùng thẳng faster-whisper, bỏ qua FunASR hoàn toàn.
+# Nếu asr_backend="funasr" mà bị lỗi (thiếu package `funasr`, lỗi tải model,
+# lỗi lúc transcribe...) thì asr.py sẽ TỰ ĐỘNG fallback sang faster-whisper —
+# chỉ cần đổi giá trị này nếu muốn tắt hẳn FunASR, không cần sửa code.
+asr_backend = "funasr"
+
+# ---- ASR — FunASR (backend chính) ----
+asr_funasr_model = "paraformer-zh"    # hoặc "iic/SenseVoiceSmall" (đa ngôn ngữ)
+asr_funasr_vad_model = "fsmn-vad"
+asr_funasr_punc_model = "ct-punc"
+asr_funasr_device = "auto"            # auto | cuda | cpu
+asr_funasr_language = "auto"          # auto | zh | en | ja | ko | yue (tuỳ model)
+
+# ---- ASR — faster-whisper (phương án dự phòng / asr_backend="whisper") ----
+asr_model_size = "small"          # tiny/base/small/medium/large-v3
+asr_device = "auto"               # auto | cuda | cpu
+asr_compute_type = "auto"         # auto | float16 | int8
+asr_language = "vi"               # mã ngôn ngữ ASR, để trống "" để auto-detect
+
+# ---- Vision ----
+# "local" (mặc định, cần GPU) | "cerebras" (Gemma 4 31B qua API — free tier chỉ 5 RPM/
+# 30K TPM/1M TPD, tối đa 2 ảnh/request; không hợp cho video nhiều scene, chỉ dùng cho
+# video ngắn hoặc khi không có GPU. Chất lượng đọc ảnh của Gemma 4 cũng yếu hơn model
+# vision chuyên dụng.) | "moondream" (CPU-only, nhẹ) | "gemma4_video" (Gemma 4 12B,
+# xem trực tiếp clip video + phụ đề đồng bộ thay vì ảnh tĩnh, có thinking mode —
+# chất lượng cao nhất nhưng chậm nhất trên CPU-only; xem khối "gemma4_*" bên dưới)
+vision_backend = "mistral"
+cerebras_vision_model = "gemma-4-31b"
+cerebras_vision_max_images = 2
+cerebras_vision_rpm = 5
+
+# ---- Vision backend "mistral" ----
+mistral_vision_model = "mistral-large-latest"   # model multimodal lớn nhất của Mistral hiện tại
+mistral_vision_max_images = 8                  # số ảnh tối đa gửi mỗi request (frames_per_scene thường <= số này)
+mistral_vision_rpm = 15                        # throttle nhẹ để tránh 429, có retry tự động nếu vượt
+
+# ---- Vision backend "gemma4_video" (Gemma 4 12B QAT CHÍNH THỨC, chạy QUA
+# OLLAMA — đã kiểm chứng chạy thành công trên GitHub Actions ở handandfeet-agent) ----
+# Cơ chế THINKING theo mức độ, MẶC ĐỊNH LÀ CAO NHẤT:
+#   gemma4_reasoning_effort = "high" | "medium" | "low" | "none"
+#   "high" = suy nghĩ sâu nhất, chất lượng cao nhất, chậm nhất.
+gemma4_model_name = "gemma4:12b-it-qat"
+gemma4_ollama_base_url = "http://127.0.0.1:11434/v1"
+gemma4_reasoning_effort = "high"
+gemma4_frames_per_clip = 6           # số frame cách đều trích từ mỗi clip gửi cho Ollama
+gemma4_max_clip_seconds = 60         # giới hạn cứng của model (60s), đừng đặt > 60
+gemma4_max_new_tokens = 8192         # gộp cả phần thinking lẫn phần JSON trả lời cuối
+gemma4_generation_timeout_sec = 1800 # watchdog timeout mỗi clip — bắt buộc phải có
+
+vision_model_name = "Qwen/Qwen3-VL-4B-Instruct"
+vision_device = "auto"            # auto | cuda | cpu
+vision_dtype = "float16"          # float16 | bfloat16 | float32
+vision_max_new_tokens = 512
+vision_attn_implementation = "sdpa"  # sdpa | flash_attention_2 (tự fallback nếu không hỗ trợ)
+vision_batch_size = 4              # tăng nếu còn dư VRAM (không đổi chất lượng, chỉ tăng thông lượng GPU)
+# Số khung hình đại diện lấy ra cho mỗi scene khi phân tích thị giác.
+vision_frames_per_scene = 3
+
+# ---- Scene detection ----
+scene_threshold = 27.0            # ngưỡng PySceneDetect (ContentDetector)
+min_scene_len_sec = 1.0
+
+# ---- Narration / storyboard ----
+narration_pov = "third_person"    # third_person | first_person
+content_type = "movie"            # movie | tv_drama | anime | short_drama | foreign_language_commentary
+genre = "drama"
+target_duration_sec = 180
+# Sau khi sinh 10 hook mở đầu (đã sắp xếp theo tiềm năng viral), nếu chạy
+# tương tác nhưng không nhập số thứ tự trong bấy nhiêu giây, tự động chọn
+# hook #1 (tiềm năng cao nhất) — giống như nhấn Enter.
+hook_selection_timeout_sec = 300   # 5 phút
+chars_per_sec = 4.0                # tốc độ đọc ước tính CHO VĂN BẢN CHỮ HÁN (số ký tự/giây)
+words_per_sec = 2.5                 # tốc độ đọc ước tính CHO TIẾNG VIỆT/TIẾNG ANH (số từ/giây)
+buffer_after_speech = 0.1
+min_clip_duration = 1.0
+max_speed_ratio = 4.0              # source_duration / output_duration tối đa cho phép
+
+# ---- Checkpoint frequency ----
+# micro_checkpoint_interval: lưu checkpoint mỗi N item (scene/batch)
+# Càng thấp = càng gần real-time. Mặc định: 1 = mỗi item.
+micro_checkpoint_interval = 1
+# auto_sync_cloud: tự động sync lên cloud (Tigris) sau mỗi checkpoint
+auto_sync_cloud = true
+
+[reference]
+# Link video tham khảo (đối thủ) để AI đối chiếu đúng tên nhân vật/cốt
+# truyện khi viết narration — KHÔNG dùng để sao chép văn phong (xem
+# reference_video.py). Có thể để trống ở đây và nhập trực tiếp lúc TẠO
+# PROJECT (menu "1. Tạo project mới" sẽ hỏi, cách nhau bởi dấu phẩy nếu
+# nhiều link) — link đối thủ chỉ được hỏi 1 lần lúc đó, KHÔNG hỏi lại khi
+# chạy/resume pipeline sau này. Danh sách `urls` bên dưới chỉ dùng làm
+# fallback CHUNG cho project nào không nhập link riêng lúc tạo.
+urls = []
+# Ngôn ngữ phụ đề ưu tiên khi lấy transcript (thử lần lượt theo thứ tự).
+languages = ["vi", "en"]
+# Giới hạn ký tự lấy từ MỖI video tham khảo (tránh tốn quá nhiều token khi
+# viết kịch bản — transcript dài sẽ bị cắt bớt và đánh dấu "[...]").
+max_chars_per_video = 6000
+# Tầng 1: youtube-transcript-api (ưu tiên, ít bị chặn). Tầng 2 (fallback):
+# yt-dlp --write-auto-sub, chỉ dùng khi tầng 1 thất bại hoặc URL không phải
+# YouTube. Tắt fallback nếu muốn tránh hoàn toàn rủi ro bị YouTube bot-check
+# chặn (khi đó video không có transcript sẽ bị bỏ qua thay vì thử yt-dlp).
+use_ytdlp_fallback = true
+# Tên trình duyệt để yt-dlp lấy cookie đăng nhập thật (vd "chrome", "firefox",
+# "edge") — giúp giảm lỗi "Sign in to confirm you're not a bot" khi fallback
+# sang yt-dlp. Để trống "" nếu không cần (yt-dlp chạy ẩn danh).
+ytdlp_cookies_from_browser = ""
+
+[paths]
+input_video = "./input/source.mp4"
+output_dir = "./output"
+checkpoint_dir = "./checkpoints"
+model_cache_dir = "./model_cache"
+# projects_dir: nơi lưu toàn bộ project
+projects_dir = "./projects"
+
+[cloud]
+# Thông tin xác thực lưu trữ cloud (tương thích S3). Mặc định điền sẵn cho
+# Tigris — dùng được với bất kỳ provider tương thích S3 nào (Tigris,
+# Filebase, AWS S3, Cloudflare R2, v.v.), chỉ cần điền đúng endpoint_url/
+# region_name/addressing_style tương ứng bên dưới.
+# Access key để xác thực
+access_key = "PASTE_YOUR_ACCESS_KEY_HERE"
+# Secret key để xác thực
+secret_key = "PASTE_YOUR_SECRET_KEY_HERE"
+# Tên bucket — PHẢI DUY NHẤT TOÀN CỤC (giống S3), hãy đổi thành tên riêng
+# của bạn, đừng dùng nguyên giá trị mặc định.
+bucket_name = "ai-director-video"
+#
+# --- Tigris (https://www.tigrisdata.com) ---
+# endpoint_url = "https://t3.storage.dev"
+# region_name = "auto"
+# addressing_style = "virtual"
+#
+# --- Filebase (https://filebase.com) ---
+# endpoint_url = "https://s3.filebase.com"
+# region_name = "us-east-1"
+# addressing_style = "path"
+endpoint_url = "https://t3.storage.dev"
+region_name = "auto"
+addressing_style = "virtual"
+# Bật/tắt tính năng sync cloud
+enabled = true
+
+[project]
+# Cấu hình mặc định cho quản lý project
+auto_project_scan = true
+show_project_menu_on_start = true
+# Khoảng thời gian tự lưu, tính bằng giây (0 = sau mỗi stage)
+auto_save_interval = 0
+# Số lần thử lại tối đa khi sync cloud thất bại
+cloud_sync_retries = 3
+# Tự động xoá project cũ, chỉ giữ lại "keep_projects_count" project mới
+# nhất (local + cloud). Mặc định BẬT. Đặt false để tắt hẳn (giữ mọi
+# project như trước, không tự xoá gì cả).
+auto_prune_old_projects = true
+# Số project mới nhất được giữ lại khi auto_prune_old_projects = true.
+# Mặc định 1 = chỉ giữ đúng 1 project mới nhất, tự xoá hết project còn lại
+# (cả local lẫn cloud).
+keep_projects_count = 1

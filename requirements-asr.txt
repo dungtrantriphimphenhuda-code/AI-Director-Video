@@ -1,0 +1,7 @@
+# ASR backends — only needed when a speech-recognition stage actually runs.
+# FunASR = backend chính (processing.asr_backend = "funasr" mặc định).
+# faster-whisper = phương án dự phòng tự động (asr.py fallback nếu FunASR lỗi),
+# cũng là backend chính khi asr_backend = "whisper".
+funasr>=1.1.0
+modelscope>=1.9.0
+faster-whisper>=1.2.1

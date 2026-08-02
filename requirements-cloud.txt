@@ -1,0 +1,3 @@
+# Cloud storage (Tigris / bất kỳ provider S3-compatible nào) — chỉ cần khi
+# cloud.enabled = true.
+boto3>=1.34.0

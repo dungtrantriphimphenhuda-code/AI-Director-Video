@@ -1,0 +1,26 @@
+# Config (contains API keys)
+# NOTE: user explicitly chose to commit config.toml with real keys directly
+# into this public repo instead of using GitHub Secrets. Uncomment the line
+# below to go back to the safer approach (recommended for public repos).
+# config.toml
+
+# Data / model directories - created when running run.py
+input/
+output/
+checkpoints/
+model_cache/
+projects/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Firebase local cache
+.firebase/
